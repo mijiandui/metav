@@ -1,0 +1,733 @@
+#!/usr/bin/env python
+
+# -------------------------------------------------------------------------
+# METAV
+# Copyright (C) 2014 - 2015 The University of Hong Kong & L3 Bioinformatics Limited
+# Copyright (C) 2022 - 2023 Chouxian Ma <biomath_2014@163.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# -------------------------------------------------------------------------
+
+
+from __future__ import print_function
+
+import getopt
+import json
+import logging
+import multiprocessing
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import math
+from common import *
+
+logger = logging.getLogger(__name__)
+
+_usage_message = '''  
+A small pipeline to perfom virus identification from raw metagenomics NGS data.
+    1) Quality control with fastp & remove host contamination with BWA.  
+    2) Assembly use either megahit or MetaSpades.
+    3) Viral identification with virsorter2 SOP and DeepVirFinder.
+
+Contact: Chouxian Ma <biomath_2014@163.com>
+
+Usage:
+  metav [options] {{-1 <pe1> -2 <pe2> }} {{--host <host reference genome>}} {{-d <checkv_db>}} [-o <out_dir>] [-p <output_prefix>] [Options]
+
+Input options:
+    -1                       <pe1>          fasta/q paired-end #1 file, paired with file in <pe2> (supporting plain text and gz extensions)
+    -2                       <pe2>          fasta/q paired-end #2 file, paired with file in <pe1> (supporting plain text and gz extensions)
+    --host                                  host genome in FASTA format(with BWA index available)
+    -d/--db-dir              <dir>          path of checkv database(can also be set using export CHECKV_DB=<db_path>)
+   
+
+Optional Arguments:
+
+  Basic quality control options: 
+    -k/--min-seed-len        <int>          minimun seed length for a bwa hit [31]                     
+
+  Basic assembly options:
+    -a/--assembler           <str>          assembler used, selected from <megahit,metaspades>, [megahit]
+    
+    --k-list                 <int,int,..>   comma-separated list of kmer size used by megahit
+                                            all must be odd, in the range 15-{0}, increment <= 28)
+                                            [39,59,79] for megahit, [21, 33, 55] for metaspades 
+  Megahit options:
+    --min-count              <int>          minimum multiplicity for filtering (k_min+1)-mers used by megahit [2]
+    --min-contig-len         <int>          minimum length of contigs to output [500]
+    --no-mercy                              do not add mercy kmers in megahit assembling
+    
+  MetaSpades options:
+    --only-assembly                         run only assembling (without read error correction) with metaspades
+  
+  Basic viral identification options:
+    -l/--min-length           <int>         minimal contig length to viral identification, [1500]
+    --include-groups          <str>         classifier of viral groups to include(comma seperated and no space in between);
+                                            available options are dsDNAphage,NCLDV,RNA,ssDNA,ssDNA, [dsDNAphage,ssDNA]
+    --min-score               <float>       minimal score to be identified as viral, [0.5]
+    --dvf-score               <float>       DeepVirFinder score to be identified as viral [0.95]
+    -n/--num-of-split         <int>         number of parts to split raw contigs file, [10]
+
+  Hardware options:
+    -t/--num-cpu-threads     <int>          number of CPU threads [# of logical processors]
+
+
+  Output options:
+    -o/--out-dir             <string>       output directory [./megahit_out]
+    -p/--out-prefix          <string>       output prefix, eg. sample name
+    -f/--force                              overwritten exist directory
+    --keep-tmp-files                        keep all temporary files
+    --tmp-dir                <string>       set temp directory
+
+Other Arguments:
+    --no-split                              do not split raw contigs FASTA into multiple parts & run single virsorter instance
+    --continue                              continue a METAV run from its last available check point.
+                                            please set the output directory correctly when using this option.
+    -h/--help                               print the usage message
+    -v/--version                            print version
+'''
+
+
+
+
+class SoftwareInfo(object):
+    script_path = os.path.dirname(os.path.realpath(__file__))
+    fastp = os.path.join(script_path, '../third_party_tools/fastp/fastp')
+    bwa = os.path.join(script_path, '../third_party_tools/bwa/bwa')
+    samtools = os.path.join(script_path, '../third_party_tools/samtools/samtools')
+    megahit = os.path.join(script_path, '../third_party_tools/megahit-1.2.9/build/megahit')
+    metaspades = os.path.join(script_path, '../third_party_tools/SPAdes-3.15.5/bin/metaspades.py')
+    conda_sh = os.getenv('CONDA_SH', os.path.join(os.getenv('HOME'), 'miniconda3/etc/profile.d/conda.sh'))
+    virsort_conda_env = 'vs2'
+    dvf_conda_env = 'dvf'
+    virsort2_sop = os.path.join(script_path, 'virsort2_sop.py')
+    deepvirfinder = os.path.join(script_path, '../third_party_tools/DeepVirFinder/dvf.py')
+    viral_screen_script = os.path.join(script_path, 'viral_screen')
+
+    @property
+    def metav_version(self):
+        return 'METAV v1.0.1'
+
+    @property
+    def max_k_allowed(self):
+        return 141
+
+    @property
+    def usage_message(self):
+        return _usage_message.format(self.max_k_allowed)
+
+class Options:
+    def __init__(self):
+        self.out_dir = ''
+        self.temp_dir = ''
+        self.test_mode = False
+        self.continue_mode = False
+        self.force_overwrite = False
+        self.do_not_split = False
+        self.min_contig_len = 500
+        self.k_list = []
+        self.set_list_by_min_max_step = False
+        self.min_count = 2
+        self.no_mercy = False
+        self.num_cpu_threads = 0
+        self.fastp_threads = 16
+        self.bwa_threads = 0
+        self.min_seed_len = 31
+        self.assembler = 'megahit'
+        self.megahit_threads = 0
+        self.only_assembly = False
+        self.spades_threads = 0
+        self.keep_tmp_files = False
+        self.out_prefix = ''
+        self.kmin_1pass = False
+        self.min_score = 0.5
+        self.viral_groups = 'dsDNAphage,ssDNA'
+        self.db_dir = os.getenv('CHECKV_DB')
+        self.min_length = 1500
+        self.dvf_score = 0.95
+        self.nparts = 10
+        self.pe1 = []
+        self.pe2 = []
+        self.host_genome=''
+        self.verbose = False
+
+    @property
+    def log_file_name(self):
+        if self.out_prefix == '':
+            return os.path.join(self.out_dir, 'log')
+        else:
+            return os.path.join(self.out_dir, self.out_prefix + '.log')
+
+    @property
+    def option_file_name(self):
+        return os.path.join(self.out_dir, 'options.json')
+
+    @property
+    def qc_dir(self):
+        return os.path.join(self.out_dir, '00.qc')
+    
+    @property
+    def read1_clean_reads(self):
+        if self.out_prefix == '':
+            return os.path.join(self.qc_dir, 'sample.clean.1.fq.gz')
+        else:
+            return os.path.join(self.qc_dir, self.out_prefix + '.clean.1.fq.gz')
+
+    @property
+    def read2_clean_reads(self):
+        if self.out_prefix == '':
+            return os.path.join(self.qc_dir, 'sample.clean.2.fq.gz')
+        else:
+            return os.path.join(self.qc_dir, self.out_prefix + '.clean.2.fq.gz')
+    
+    @property
+    def assembly_dir(self):
+        return os.path.join(self.out_dir, '01.assembly')
+
+    @property
+    def contig_file(self):
+        if self.out_prefix == '':
+            return os.path.join(self.assembly_dir, 'contigs.fa')
+        else:
+            return os.path.join(self.assembly_dir, self.out_prefix + '.contigs.fa')
+
+    @property
+    def viral_identification_dir(self):
+        return os.path.join(self.out_dir, '02.viral_id')
+    
+    @property
+    def checkv_contamination_table(self):
+        return os.path.join(self.viral_identification_dir, 'virsort2_checkv/checkv/contamination.tsv')
+
+    @property
+    def virsort2_pass1_score_file(self):
+       return os.path.join(self.viral_identification_dir, 'virsort2_checkv/vs2-pass1/final-viral-score.tsv')
+
+    @property
+    def dvf_score_table(self):  
+       return os.path.join(self.viral_identification_dir, 'dvf/{contig_file_basename}_gt{min_len}bp_dvfpred.txt'.format(contig_file_basename=os.path.basename(opt.contig_file), min_len=opt.min_length))
+
+    @property
+    def fastp(self):
+        return software_info.fastp
+
+    @property
+    def bwa(self):
+        return software_info.bwa
+
+    @property
+    def samtools(self):
+        return software_info.samtools
+    
+    @property
+    def megahit(self):
+        return software_info.megahit
+    
+    @property
+    def metaspades(self):
+        return software_info.metaspades
+    
+    @property
+    def conda_sh(self):
+        return software_info.conda_sh
+
+    @property
+    def virsort2_sop(self):
+        return software_info.virsort2_sop
+
+    @property
+    def deepvirfinder(self):
+        return software_info.deepvirfinder
+    
+    @property
+    def viral_screen_script(self):
+        return software_info.viral_screen_script
+
+    def dump(self):
+        with open(self.option_file_name, 'w') as f:
+            json.dump(self.__dict__, f)
+
+    def load_for_continue(self):
+        with open(self.option_file_name, 'r') as f:
+            self.__dict__.update(json.load(f))
+
+
+software_info = SoftwareInfo()
+opt = Options()
+check_point = Checkpoint(logger)
+
+
+def check_bin():
+    if not os.path.exists(opt.fastp):
+        raise Usage('Cannot find fastp, please recompile.')
+    
+    if not os.path.exists(opt.bwa):
+        raise Usage('Cannot find bwa, please recompile.')
+    
+    if not os.path.exists(opt.samtools):
+        raise Usage('Cannot find samtools, please recompile.')
+
+    if not os.path.exists(opt.megahit):
+        raise Usage('Cannot find magahit, please recompile.')
+
+    if not os.path.exists(opt.metaspades):
+        raise Usage('Cannot find metaspades, please recompile.')
+    
+    if not os.path.exists(opt.conda_sh):
+        raise Usage('Cannot find conda, please install conda.')
+    
+
+def run_sub_command(cmd, msg, verbose=False):
+    if opt.verbose:
+        verbose = opt.verbose
+
+    logger.info(msg)
+    cmd_str = ' '.join(cmd)
+    logger.info('command %s' % cmd_str)
+
+    start_time = time.time()
+    
+    try:
+        p = subprocess.run(cmd_str, shell=True, check=True, capture_output=True)
+
+        logger.info(p.stderr.decode('utf-8'))
+
+        if p.returncode != 0:
+            logger.error('Error occurs, please refer to %s for detail' % opt.log_file_name)
+            logger.error('Command: %s; Exit code %d' % (cmd_str, int(ret_code)))
+            exit(ret_code)
+    except KeyboardInterrupt:
+        exit(signal.SIGINT)
+
+    logger.info('CMD DONE. Time elapsed: %f seconds ' % (time.time() - start_time))
+
+def parse_option(argv):
+    try:
+        opts, args = getopt.getopt(argv, 'hvo:t:1:2:k:p:a:l:d:n:f',
+                                   ['help',
+                                    'out-dir=',
+                                    'min-contig-len=',
+                                    'num-cpu-threads=',
+                                    'k-list=',
+                                    'min-count=',
+                                    'no-mercy',
+                                    'keep-tmp-files',
+                                    'tmp-dir=',
+                                    'host=',
+                                    'fastp-threads=',
+                                    'bwa-threads=',
+                                    'min-seed-len=',
+                                    'assembler=',
+                                    'min-contig-len=',
+                                    'megahit-threads=',
+                                    'only-assembly',
+                                    'spades-threads',
+                                    'include-groups=',
+                                    'min-score=',
+                                    'min-length=',
+                                    'dvf-score=',
+                                    'db-dir=',
+                                    'num-of-split=',
+                                    'continue',
+                                    'version',
+                                    'verbose',
+                                    'no-split',
+                                    'out-prefix=',
+                                    'force'])
+    except getopt.error as msg:
+        raise Usage(software_info.metav_version + '\n' + str(msg))
+    if len(opts) == 0:
+        raise Usage(software_info.metav_version + '\n' + software_info.usage_message)
+
+    for option, value in opts:
+        if option in ('-h', '--help'):
+            print(software_info.metav_version + '\n' + software_info.usage_message)
+            exit(0)
+        elif option in ('-o', '--out-dir'):
+            opt.out_dir = abspath(value)
+        elif option == '--min-contig-len':
+            opt.min_contig_len = int(value)
+        elif option in ('-t', '--num-cpu-threads'):
+            opt.num_cpu_threads = int(value)
+        elif option == '--k-list':
+            opt.k_list = list(map(int, value.split(',')))
+            opt.k_list.sort()
+        elif option == '--min-count':
+            opt.min_count = int(value)
+        elif option == '--no-mercy':
+            opt.no_mercy = True
+        elif option == '--keep-tmp-files':
+            opt.keep_tmp_files = True
+        elif option in ('-v', '--version'):
+            print(software_info.metav_version)
+            exit(0)
+        elif option == '--verbose':
+            opt.verbose = True
+        elif option == '--continue':
+            opt.continue_mode = True
+        elif option == '--no-split':
+            opt.do_not_split = True
+        elif option in ('-p', '--out-prefix'):
+            opt.out_prefix = value
+        elif option == '--tmp-dir':
+            opt.temp_dir = abspath(value)
+        elif option == '-1':
+            opt.pe1 += [abspath(f) for f in value.split(',')]
+        elif option == '-2':
+            opt.pe2 += [abspath(f) for f in value.split(',')]
+        elif option in ('-f', '--force'):
+            opt.force_overwrite = True
+        elif option == '--host':
+            opt.host_genome = value
+        elif option in ('-k', '--min-seed-len'):
+            opt.min_seed_len = int(value)
+        elif option in ('-a', '--assembler'):
+            opt.assembler = value
+        elif option == '--fastp-threads':
+            opt.fastp_threads = int(value)
+        elif option == '--bwa-threads':
+            opt.bwa_threads = int(value)
+        elif option == '--megahit-threads':
+            opt.megahit_threads = int(value)
+        elif option == '--only-assembly':
+            opt.only_assembly = True
+        elif option == '--spades-threads':
+            opt.spades_threads = True
+        elif option in ('-d', '--db-dir'):
+            opt.db_dir = value
+        elif option == '--include-groups':
+            opt.viral_groups = value
+        elif option == '--min-score':
+            opt.min_score = float(value)
+        elif option == '--min-length':
+            opt.min_length = int(value)
+        elif option in ('-n', '--num-of-split'):
+            opt.nparts = int(value)
+        else:
+            raise Usage('Invalid option {0}'.format(option))
+
+
+def setup_output_dir():
+    if not opt.out_dir:
+        opt.out_dir = abspath('./metav_out')
+
+    check_point.set_file(os.path.join(opt.out_dir, 'checkpoints.txt'))
+
+    if opt.continue_mode and not os.path.exists(opt.option_file_name):
+        print('Cannot find {0}, switching to normal mode'.format(opt.option_file_name), file=sys.stderr)
+        opt.continue_mode = False
+
+    if opt.continue_mode:
+        print('Continue mode activated. Ignore all options except for -o/--out-dir.', file=sys.stderr)
+        opt.load_for_continue()
+        check_point.load_for_continue()
+    else:
+        if not opt.force_overwrite and not opt.test_mode and os.path.exists(opt.out_dir):
+            raise Usage(
+                'Output directory ' + opt.out_dir +
+                ' already exists, please change the parameter -o to another value to avoid overwriting.')
+
+        if opt.temp_dir == '':
+            opt.temp_dir = os.path.join(opt.out_dir, 'tmp')
+        else:
+            opt.temp_dir = tempfile.mkdtemp(dir=opt.temp_dir, prefix='metav_tmp_')
+
+    mkdir_if_not_exists(opt.out_dir)
+    mkdir_if_not_exists(opt.temp_dir)
+    mkdir_if_not_exists(opt.qc_dir)
+    mkdir_if_not_exists(opt.viral_identification_dir)
+
+
+def setup_logger():
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S')
+
+    file_handler = logging.FileHandler(opt.log_file_name, 'a')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+    logger.addHandler(console)
+
+
+
+def check_and_correct_option():
+    # set mode
+
+    if len(opt.k_list) == 0:
+        if opt.assembler == 'megahit':
+            opt.k_list = [39, 59, 79]
+        else:
+            opt.k_list = [21, 33, 55]
+
+    if opt.k_list[0] < 15 or opt.k_list[-1] > software_info.max_k_allowed:
+        raise Usage('All k\'s should be in range [15, %d]' % software_info.max_k_allowed)
+
+    for k in opt.k_list:
+        if k % 2 == 0:
+            raise Usage('All k must be odd number!')
+
+    if opt.assembler == 'megahit':
+        for i in range(1, len(opt.k_list)):
+            if opt.k_list[i] - opt.k_list[i - 1] > 28:
+                raise Usage('k-step (adjacent k difference) must be <= 28')
+
+    opt.k_min, opt.k_max = opt.k_list[0], opt.k_list[-1]
+
+    if opt.k_max < opt.k_min:
+        raise Usage('--k-min should not be larger than --k-max.')
+    if opt.min_count <= 0:
+        raise Usage('--min-count must be greater than 0.')
+    
+    if opt.num_cpu_threads > multiprocessing.cpu_count():
+        logger.warning('Maximum number of available CPU thread is %d.' % multiprocessing.cpu_count())
+        logger.warning('Number of thread is reset to the %d.' % multiprocessing.cpu_count())
+        opt.num_cpu_threads = multiprocessing.cpu_count()
+    if opt.num_cpu_threads == 0:
+        opt.num_cpu_threads = multiprocessing.cpu_count()
+    
+    if opt.bwa_threads == 0:
+        opt.bwa_threads = opt.num_cpu_threads
+
+    if opt.megahit_threads == 0:
+        opt.megahit_threads = opt.num_cpu_threads
+    
+    if opt.spades_threads == 0:
+        opt.spades_threads = opt.num_cpu_threads
+
+    if opt.nparts < 2 or opt.nparts > 20:
+        raise Usage("The number of split must be in range [2, 20], too large n will lead to runtime error in virsorter step.")
+
+    # checkv database
+    if opt.db_dir != '':
+        opt.db_dir = abspath(opt.db_dir)
+    else:
+        opt.db_dir = abspath(os.getenv('CHECKV_DB'))
+        if opt.db_dir == '':
+            raise Usage("could not locate checkv database, set ENV variables using 'export CHECKV_DB=<checkv_db_path>' or specify using '-d/--db-dir'.")
+
+    if not os.path.exists(opt.db_dir):
+        raise Usage('could not find checkv databse: ' + opt.db_dir)
+
+    if opt.host_genome != '':
+        check_bwa_index(opt.host_genome)
+
+def check_bwa_index(host_reference):
+    if not os.path.exists(host_reference):
+        raise Usage('can not find host reference genome ' + host_reference)
+    suffixes = ['.amb', '.ann', '.bwt', '.pac', '.sa']
+    for sfx in suffixes:
+        if not os.path.exists(host_reference + sfx):
+            raise Usage('Incomplete BWA index, please create index using command: %s index %s' % (opt.bwa, host_reference))
+
+
+def check_input():
+    if len(opt.pe1) != len(opt.pe2):
+        raise Usage('Number of paired-end files not match!')
+    for r in opt.pe1 + opt.pe2:
+        if not os.path.exists(r):
+            raise Usage('Cannot find file ' + r)
+    
+# pipeline steps
+@check_point
+def quality_control():
+    qc_cmd = [opt.fastp, 
+             '-i', opt.pe1[0], 
+             '-I', opt.pe2[0],
+             '--stdout',
+             '--detect_adapter_for_pe',
+             '--dont_eval_duplication',
+             '-w', str(opt.fastp_threads),
+             '-j', os.path.join(opt.qc_dir, opt.out_prefix + "_fastp.json"),
+             '-h', os.path.join(opt.qc_dir, opt.out_prefix + "_fastp.html"),
+             '|',
+             opt.bwa, 'mem',
+             '-k', str(opt.min_seed_len),
+             '-p', '-S', '-K 200000000',
+             '-t', str(opt.bwa_threads),
+             opt.host_genome, '-',
+             '|',
+             opt.samtools, 'fastq',
+             '-@', str(16), '-f', '0x4', '-n', '-0', '/dev/null', '-s', '/dev/null',
+             '-1', opt.read1_clean_reads,
+             '-2', opt.read2_clean_reads]
+
+    run_sub_command(qc_cmd, 'Quality control for raw reads and decontamination(eg. remove host reads from metagenome) ')
+
+
+@check_point
+def assemble():
+
+    if not opt.continue_mode and os.path.exists(opt.assembly_dir):
+        shutil.rmtree(opt.assembly_dir)
+
+    assembly_cmd = []
+    if opt.assembler == 'megahit':
+        if opt.continue_mode:
+            assembly_cmd = [opt.megahit, '-o', opt.assembly_dir, '--continue']
+        else:
+            assembly_cmd = [opt.megahit,
+                        '-1', opt.read1_clean_reads,
+                        '-2', opt.read2_clean_reads,
+                        '-t', str(opt.megahit_threads),
+                        '--k-list', ','.join(list(map(str, opt.k_list))),
+                        '--min-count', str(opt.min_count),
+                        '--min-contig-len', str(opt.min_contig_len),
+                        '-o', opt.assembly_dir,
+                        '--out-prefix', opt.out_prefix,
+                        '--tmp-dir', opt.temp_dir]
+            if opt.no_mercy:
+                assembly_cmd += ['--no-mercy']
+    elif opt.assembler == 'metaspades':
+        if opt.continue_mode:
+            assembly_cmd = [opt.metaspades, '-o', opt.assembly_dir, '--continue']
+        else:
+            assembly_cmd = [opt.metaspades, 
+                            '-o', opt.assembly_dir, 
+                            '-1', opt.read1_clean_reads,
+                            '-2', opt.read2_clean_reads,
+                            '-k', ' '.join(map(str, opt.k_list)),
+                            '--checkpoints last',
+                            '-t', str(opt.spades_threads)]
+    else:
+        raise Usage('Unrecognized assembler')
+
+    run_sub_command(assembly_cmd, 'Assemble contigs use %s' % opt.assembler)
+    
+    if opt.assembler == 'metaspades':
+        contig_file = os.path.join(opt.assembly_dir, "contigs.fasta")
+        if not os.path.exists(contig_file):
+            raise Usage('Contig file dose not exist: %s' % contig_file)
+        rename_cmd = ['ln -sf', contig_file, opt.contig_file]
+        run_sub_command(rename_cmd, 'Rename contig file')
+
+_VIRSORT_SH = '''
+#!/bin/bash
+set -e
+
+source {conda_sh}
+conda activate {virsort_conda_env} && {virsort_sop} -i {contig_file} \
+  -d {checkv_database} \
+  -t {threads} \
+  -o {virsort2_sop_output} \
+  --min-length {min_length} \
+  -p {output_prefix} \
+  --tmp-dir {tmp_dir} \
+  --include-groups {viral_groups} \
+  -n  {nparts} {split_or_not} \
+  --min-score {min_score} -f && conda deactivate
+
+'''
+
+_DVF_SH = '''
+#!/bin/bash
+set -e
+
+source {conda_sh}
+conda activate {dvf_conda_env} && python {dvf} -i {contig_file} -o {dvf_outdir} -l {min_length} && conda deactivate
+
+'''
+
+@check_point
+def virsort2_checkv():
+    # run virsort sop
+    virsort_sh = _VIRSORT_SH.format(conda_sh=opt.conda_sh, virsort_conda_env=software_info.virsort_conda_env,
+                             virsort_sop=opt.virsort2_sop, contig_file=opt.contig_file,
+                             checkv_database=opt.db_dir, threads=str(opt.num_cpu_threads),
+                             virsort2_sop_output=os.path.join(opt.viral_identification_dir, 'virsort2_checkv'),
+                             min_length=str(opt.min_length), output_prefix=opt.out_prefix,
+                             tmp_dir = opt.temp_dir, viral_groups=opt.viral_groups, nparts=str(opt.nparts), split_or_not='--no-split' if opt.do_not_split else '', min_score=opt.min_score)
+
+    vs2_sh_file = os.path.join(opt.viral_identification_dir, 'run_virsort_sop.sh')
+    with open(vs2_sh_file, "w") as f:
+        f.write(virsort_sh)
+
+    run_sub_command(['bash', vs2_sh_file], "run Virsorter & checkv SOP")
+    
+@check_point
+def dvf():
+    # run deepVirFinder
+    dvf_sh = _DVF_SH.format(conda_sh=opt.conda_sh, dvf_conda_env=software_info.dvf_conda_env,
+                            dvf=opt.deepvirfinder, contig_file=opt.contig_file, 
+                            dvf_outdir=os.path.join(opt.viral_identification_dir, 'dvf'), min_length=str(opt.min_length))
+    dvf_sh_file = os.path.join(opt.viral_identification_dir, 'run_dvf.sh')
+    with open(dvf_sh_file, "w") as f:
+        f.write(dvf_sh)
+    
+    run_sub_command(['bash', dvf_sh_file], "run DeepVirFinder")
+
+ 
+@check_point
+def viral_screen():
+    cmd = [opt.viral_screen_script, 
+           '-i', opt.contig_file,
+           '-s', opt.virsort2_pass1_score_file,
+           '-c', opt.checkv_contamination_table,
+           '-d', opt.dvf_score_table,
+           '-o', opt.viral_identification_dir, '-p', opt.out_prefix, '-z', str(opt.dvf_score)]
+    
+    run_sub_command(cmd, "Viral screen based on virsorter and DeepVirFinder results")
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+
+    try:
+        start_time = time.time()
+        setup_logger()
+        check_bin()
+        parse_option(argv[1:])
+        setup_output_dir()
+        check_and_correct_option()
+        check_input()
+        opt.dump()
+
+        logger.info(software_info.metav_version)
+        logger.info('Start pipeline. Number of CPU threads %d ' % opt.num_cpu_threads)
+        logger.info('k list: %s ' % ','.join(map(str, opt.k_list)))
+
+        # quality control of raw reads
+        quality_control()
+
+        # assembly
+        assemble()
+
+        # viral identification
+        virsort2_checkv()
+        dvf()
+        viral_screen()
+
+
+        if not opt.keep_tmp_files and os.path.exists(opt.temp_dir):
+            shutil.rmtree(opt.temp_dir)
+
+        open(os.path.join(opt.out_dir, 'done'), 'w').close()
+
+        logger.info('ALL DONE. Time elapsed: %f seconds ' % (time.time() - start_time))
+
+    except Usage as usg:
+        print(sys.argv[0].split('/')[-1] + ': ' + str(usg.msg), file=sys.stderr)
+        exit(1)
+
+
+if __name__ == '__main__':
+    main()

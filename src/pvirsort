@@ -1,0 +1,264 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $contig_file;
+my $nparts = 10;
+my $outdir = '';
+my $min_len = 1500;
+my $min_score = 0.5;
+my $viral_groups = "dsDNAphage,ssDNA";
+my $nthreads = 8;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$contig_file,
+                                "o:s"=>\$outdir,
+                                "n:i"=>\$nparts,
+                                "l:i"=>\$min_len,
+                                "t:i"=>\$nthreads,
+                                "s:s"=>\$min_score,
+                                "g:s"=>\$viral_groups,
+                                ) or &USAGE;
+&USAGE unless ($contig_file);
+
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+
+$contig_file = Cwd::abs_path($contig_file);
+logger("contig file dose not exist: $contig_file", "ERROR") unless -e $contig_file;
+
+logger("The number of split parts must be in range [2, 20]", "ERROR") if ($nparts > 20 or $nparts < 2);
+
+###############
+# check env
+###############
+my $home_dir = $ENV{HOME};
+my $conda_sh = "$home_dir/miniconda3/etc/profile.d/conda.sh";
+logger("conda sh not found: $conda_sh", "ERROR") unless -e $conda_sh;
+
+my $parallel = `which parallel`; chomp $parallel;
+logger("GNU parallel not found, please install it", "ERROR") if $parallel eq "";
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+my $cmd;
+
+###############
+# split fasta
+###############
+logger("Split fasta file");
+my $split_dir = "$outdir/split_dir";
+rmdir $split_dir if -d $split_dir;
+mkdir $split_dir;
+
+round_robin_split($contig_file, $split_dir, $nparts);
+
+sub round_robin_split {
+   my $fasta = shift;
+   my $dir = shift;
+   my $n = shift;
+
+   my @fhs;
+   for(my $i = 0; $i < $n; ++$i){
+      open $fhs[$i], ">$dir/slice_$i.fa" or die $!;
+   }
+
+   local $/=">";
+   my $count = 0;
+   open IN, $fasta or die $!;
+   while(<IN>){
+       chomp;
+       next if (/^$/);
+
+       my $idx = (($count/$n)&0x1) ? ($n - 1 - $count % $n) : ($count % $n);
+       print {$fhs[$idx]} ">$_";
+       
+       $count++; 
+   }
+   close IN;
+   for(my $i = 0; $i < $n; ++$i){
+      close $fhs[$i];
+   }
+}
+
+######################
+# write worker shell
+######################
+logger("Write virsort2 worker shell");
+
+my $worker_sh_dir = "$outdir/worker_sh";
+mkdir $worker_sh_dir unless -d $worker_sh_dir;
+my @contigs_fa_files = glob("$split_dir/*.fa");
+logger("Incorrect number of split contigs fasta files", "ERROR") if @contigs_fa_files != $nparts;
+
+foreach my $file (@contigs_fa_files){
+   my $prefix = basename($file);
+   open SH, ">$worker_sh_dir/$prefix.sh" or die $!;
+
+   print SH "#!/bin/sh\n";
+   print SH "set -e\n";
+   print SH "source $conda_sh\n";
+   print SH "conda activate vs2 && ";
+   print SH "virsorter run --keep-original-seq -i $file -w $split_dir/$prefix\_vs2 --min-length $min_len --min-score $min_score --include-groups $viral_groups --tmpdir $split_dir/$prefix\_vs2/tmp -j $nthreads all";
+   print SH "&& conda deactivate\n";
+   close SH;
+}
+
+################
+# parallel run 
+################
+logger("parallel run virsorter2");
+my @all_scripts = glob("$worker_sh_dir/*.sh");
+my $all_sh = "$outdir/pvirsorter.sh";
+logger("Incorrect number of split contigs fasta files", "ERROR") if @all_scripts != $nparts;
+open SH, ">$all_sh" or die $!;
+foreach my $sh (@all_scripts) {
+    print SH "bash $sh\n";
+}
+close SH;
+
+$cmd = "$parallel -j $nparts < $all_sh";
+run($cmd);
+
+################
+# merge result
+################
+logger("merge results");
+#test/split_dir/slice_1.fa_vs2/final-viral-boundary.tsv
+#test/split_dir/slice_1.fa_vs2/final-viral-combined.fa
+#test/split_dir/slice_1.fa_vs2/final-viral-score.tsv
+
+# fasta
+my @fa_results = glob("$split_dir/*vs2/final-viral-combined.fa");
+logger("Incomplete results, require $nparts final-viral-combined.fa", "ERROR") if @fa_results != $nparts;
+$cmd = "cat @fa_results >$outdir/final-viral-combined.fa";
+run($cmd);
+
+# score tsv
+my @score_tsv_results = glob("$split_dir/*vs2/final-viral-score.tsv");
+logger("Incomplete results, require $nparts final-viral-score.tsv", "ERROR") if @score_tsv_results != $nparts;
+merge_tsv(\@score_tsv_results, "$outdir/final-viral-score.tsv");
+
+# boundary tsv
+my @boundary_tsv_results = glob("$split_dir/*vs2/final-viral-boundary.tsv");
+logger("Incomplete results, require $nparts final-viral-boundary.tsv", "ERROR") if @boundary_tsv_results != $nparts;
+merge_tsv(\@boundary_tsv_results, "$outdir/final-viral-boundary.tsv");
+
+sub merge_tsv {
+    # for tsv with one header line
+    my $files_to_merge = shift;
+    my $ofile = shift;
+
+    my $write_header_once = 0;
+    open O, ">$ofile" or die $!;
+
+    local $/="\n";
+    foreach my $f (@$files_to_merge){
+   	open IN, $f or die $!; 
+    	if ($write_header_once){
+	    <IN>; # skip header
+	}else{
+	    my $header = <IN>;
+	    print O $header;
+	    $write_header_once = 1;
+	}
+
+	while(<IN>){
+	    chomp;
+	    next if (/^$/);
+	    print O $_, "\n";
+	}
+	close IN;
+    }
+
+    close O;
+}
+
+
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub run {
+    my $cmd = shift;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s");
+    logger("CMD Done.");
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	run virsort in parallel
+
+Usage:
+  Options:
+  -i    <file>          input contig FASTA file, forced
+  -o    <dir>           output dir , forced
+  -n    <int>           the number of chunks to split original contigs.fa, default [$nparts]
+  -l    <int>           minimal contig length to be identified as viral by virsorter2, default [$min_len]
+  -s    <float>         minmal score to be identified as viral by virsorter2, default [$min_score]
+  -g    <str>           list of viral groups to identify, comma seperated, default [$viral_groups]
+  -t    <int>           the number of threads used in single virsort job, default [$nthreads]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

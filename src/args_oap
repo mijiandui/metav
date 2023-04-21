@@ -1,0 +1,380 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $fq1;
+my $fq2;
+my $outdir;
+my $database_dir;
+my $threads = 32;
+my $stage = 1;  # for stage one 
+my $run_single_stage;
+my $conda_env = "args_oap3.2";
+
+my $use_diamond;
+my $args; 
+my $mge;
+my $mrg;
+my $continue_mode;
+
+# custom mge db
+my $mge_database;
+my $mge_structure_list;
+
+# custom mrg db
+my $mrg_database;
+my $mrg_structure_list;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "1:s"=>\$fq1,
+                                "2:s"=>\$fq2,
+                                "o:s"=>\$outdir,
+                                "d:s"=>\$database_dir,
+                                "t:i"=>\$threads,
+                                "s:i"=>\$stage,
+                                "args"=>\$args,
+                                "mge"=>\$mge,
+                                "mge-db:s"=>\$mge_database,
+                                "mge-st:s"=>\$mge_structure_list,
+                                "mrg"=>\$mrg,
+                                "mrg-db:s"=>\$mrg_database,
+                                "mrg-st:s"=>\$mrg_structure_list,
+                                "use-diamond"=>\$use_diamond,
+                                "one-stage"=>\$run_single_stage,
+                                "conda-env:s"=>\$conda_env,
+                                "continue"=>\$continue_mode,
+                                ) or &USAGE;
+&USAGE unless ($fq1 && $fq2 && $database_dir && $outdir);
+
+logger("you should specify at least one of {--args, --mge, --mrg}", "ERROR") unless ($args or $mge or $mrg);
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+
+$fq1 = Cwd::abs_path($fq1);
+$fq2 = Cwd::abs_path($fq2);
+$database_dir = Cwd::abs_path($database_dir);
+
+logger("Stage must be in range [1, 2]", "ERROR") if ($stage > 2 or $stage < 1);
+
+# check existence of files 
+logger("fq1 $fq1 dose not exist", "ERROR") unless -e $fq1;
+logger("fq2 $fq2 dose not exist", "ERROR") unless -e $fq2;
+#logger("structure list $structure_list dose not exist", "ERROR") unless -e $structure_list;
+
+logger("database dir dose not exists", "ERROR") unless -d $database_dir;
+
+# check databse
+if (defined $args){
+  # nothing to do
+}
+
+$mge_database ||= "$database_dir/MGEs_protein.fa";
+$mge_structure_list ||= "$database_dir/MGEs_structure.txt";
+if (defined $mge){
+    logger("MGE database file $mge_database dose not exist", "ERROR") unless -e $mge_database;
+    logger("MGE structure list file $mge_structure_list dose not exist", "ERROR") unless -e $mge_structure_list;  
+}
+
+$mrg_database ||= "$database_dir/BacMet_EXP_predicted.merged.fa";
+$mrg_structure_list ||= "$database_dir/BacMet2_merge_structure.txt";
+if (defined $mrg){
+    logger("MRG database file $mrg_database dose not exist", "ERROR") unless -e $mrg_database;
+    logger("MRG structure list file $mrg_structure_list dose not exist", "ERROR") unless -e $mrg_structure_list;
+}
+
+###############
+# check env
+###############
+my $home_dir = $ENV{HOME};
+my $conda_sh = "$home_dir/miniconda3/etc/profile.d/conda.sh";
+logger("conda sh not found: $conda_sh", "ERROR") unless -e $conda_sh;
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+my $cmd;
+
+###############
+# logging config
+###############
+my $args_enabled = defined $args ? "Yes" : "No";
+my $mge_enabled = defined $mge ? "Yes" : "No";
+my $mrg_enabled = defined $mrg ? "Yes" : "No";
+my $dimond_enabled = defined $use_diamond ? "Yes" : "No";
+my $continue_enabled = defined $continue_mode ? "Yes" : "No";
+my $single_stage_enabled = defined $run_single_stage ? "Yes" : "No";
+
+my $config =<<"CONFIG_END";
+########################################################
+#                CONFIGURATION                         #
+########################################################
+FQ1                     $fq1
+FQ2                     $fq2
+OUTPUT_DIR              $outdir
+DATABASE_DIR            $database_dir
+ARGS                    $args_enabled
+MGE                     $mge_enabled
+MGE_DB                  $mge_database
+MGE_STRUCTURE           $mge_structure_list
+MRG                     $mrg_enabled
+MRG_DB                  $mrg_database
+MRG_STRUCTURE           $mrg_structure_list
+THREADS                 $threads
+USE_DIAMOND             $dimond_enabled
+FROM_STAGE              $stage
+RUN_SINGLE_STAGE        $single_stage_enabled
+CONTINUE_MODE           $continue_enabled
+ARGS_OAP_CONDA_ENV      $conda_env
+CONFIG_END
+
+logger("\n$config");
+
+open CFG, ">$outdir/parameters.txt" or die $!;
+print CFG $config;
+close CFG;
+###############
+# run stage one
+###############
+
+if (defined $continue_mode){
+    if (-e "$outdir/stage_one_done"){
+        logger("skip stage one");
+        $stage = 2;
+    }
+    if (-e "$outdir/stage_two_done"){
+        logger("skip stage two");
+        $stage = 3;
+    }
+}
+
+if ($stage == 1){
+    logger("Run args_aop stage one");
+
+    my $input_dir = "$outdir/inputfqs";
+    mkdir $input_dir unless -d $input_dir;
+    run("ln -sf $fq1 $input_dir");
+    run("ln -sf $fq2 $input_dir");
+
+    my $stage_one_cmd = "";
+    if (defined $args){
+        if (defined $continue_mode && -e "$outdir/args/stage_one_done"){
+            logger("skip args stage_one");
+            $stage_one_cmd .= "";
+        }else {
+            $stage_one_cmd .= "args_oap stage_one -i $input_dir -o $outdir/args -t $threads && touch $outdir/args/stage_one_done";
+        }
+    }
+
+    if (defined $mge){
+        if (defined $continue_mode && -e "$outdir/mge/stage_one_done"){
+            logger("skip mge stage_one");
+            $stage_one_cmd .= "";
+        }else{
+            my $and_sign = $stage_one_cmd eq "" ? "" : "&&";
+            $stage_one_cmd .= " $and_sign args_oap stage_one -i $input_dir -o $outdir/mge -t $threads --database $mge_database";
+            if (defined $args){
+                $stage_one_cmd .= " --skip";
+            }
+            $stage_one_cmd .= " && touch $outdir/mge/stage_one_done";
+        }
+    }
+
+    if (defined $mrg){
+        if (defined $continue_mode && -e "$outdir/mrg/stage_one_done"){
+            logger("skip mrg stage_one");
+            $stage_one_cmd .= "";
+        }else{
+            my $and_sign = $stage_one_cmd eq "" ? "" : "&&";
+            $stage_one_cmd .= " $and_sign args_oap stage_one -i $input_dir -o $outdir/mrg -t $threads --database $mrg_database";
+            if (defined $args or defined $mge){
+                $stage_one_cmd .= " --skip";
+            }
+            $stage_one_cmd .= " && touch $outdir/mrg/stage_one_done";
+        }
+    }
+
+    if ($stage_one_cmd ne ""){
+
+        my $stage_one_sh = "$outdir/stage_one.sh";
+
+        open SH, ">$stage_one_sh" or die $!;
+        print SH "#!/bin/bash\nset -e\n\n";
+        print SH "source $conda_sh\n";
+        print SH "conda activate $conda_env &&  $stage_one_cmd && conda deactivate\n";
+        close SH;
+
+        my $cmd = "bash $stage_one_sh";
+        run($cmd);
+
+        # copy meta_data txt
+        if (defined $args){
+            run("cp $outdir/args/metadata.txt $outdir/mge") if (defined $mge);
+            run("cp $outdir/args/metadata.txt $outdir/mrg") if (defined $mrg)
+        }else{
+            run("cp $outdir/mge/metadata.txt $outdir/mrg") if (defined $mrg && defined $mge);
+        }
+
+        run("touch $outdir/stage_one_done");
+    }
+
+    $stage++;
+    goto END if ($run_single_stage);
+
+}
+
+######################
+# run stage two
+######################
+
+if ($stage == 2){
+    logger("Run args_oap stage two");
+
+    my $diamond_mode;
+    if (defined $use_diamond){
+        $diamond_mode = "--use_diamond";
+    }
+
+    my $stage_two_cmd = "";
+    if (defined $args){
+        if (defined $continue_mode && -e "$outdir/args/stage_two_done"){
+            logger("skip args stage_two");
+            $stage_two_cmd .= "";
+        }else {
+            $stage_two_cmd .= "args_oap stage_two -i $outdir/args -t $threads $diamond_mode && touch $outdir/args/stage_two_done";
+        }
+    }
+
+    if (defined $mge){
+        if (defined $continue_mode && -e "$outdir/mge/stage_two_done"){
+            logger("skip mge stage_two");
+            $stage_two_cmd .= "";
+        }else{
+            my $and_sign = $stage_two_cmd eq "" ? "" : "&&";
+            $stage_two_cmd .= " $and_sign args_oap stage_two -i $outdir/mge -t $threads $diamond_mode --database $mge_database --structure1 $mge_structure_list --skip && $Bin/merge_table -i $outdir/mge -d $mge_database -l $mge_structure_list && touch $outdir/mge/stage_two_done";
+        }
+    }
+
+    if (defined $mrg){
+        if (defined $continue_mode && -e "$outdir/mrg/stage_two_done"){
+            logger("skip mrg stage_two");
+            $stage_two_cmd .= "";
+        }else{
+            my $and_sign = $stage_two_cmd eq "" ? "" : "&&";
+            $stage_two_cmd .= "$and_sign args_oap stage_two -i $outdir/mrg -t $threads $diamond_mode --database $mrg_database --structure1 $mrg_structure_list && touch $outdir/mrg/stage_two_done";
+        }
+    }
+
+    if ($stage_two_cmd ne ""){
+        my $stage_two_sh = "$outdir/stage_two.sh";
+        open SH, ">$stage_two_sh" or die $!;
+        print SH "#!/bin/bash\nset -e\n\n";
+        print SH "source $conda_sh\n";
+        print SH "conda activate $conda_env && $stage_two_cmd && conda deactivate";
+        close SH;
+
+        my $cmd = "bash $stage_two_sh";
+        run($cmd);
+
+        run("touch $outdir/stage_two_done");
+    }
+
+    $stage++;
+
+}
+run("touch $outdir/done");
+
+END:
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub run {
+    my $cmd = shift;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s");
+
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	args_oap for one sample
+
+Usage:
+  Options:
+  -1    <file>          fq1, forced
+  -2    <file>          fq2, forced
+  -o    <dir>           output dir , forced
+  -d    <dir>           database dir, forced
+  -t    <int>           the number of threads used, default [$threads]
+  --args                do args
+  --mge                 do mge
+    --mge-db <file>     mge protein.fa
+    --mge-st <file>     mge structure list
+  --mrg                 do mge
+    --mrg-db <file>     mrg protein.fa
+    --mrg-st <file>     mrg structure list
+  --use-diamond         use diamond as an alternative option in stage two
+  --continue            continue mode
+  -s    <int>           run stage {1, 2}
+  --one-stage           run one stage
+  --conda-env           conda env name with args_oap package installed, [$conda_env]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

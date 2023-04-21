@@ -1,0 +1,125 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $wish_result_dir;
+my $outfile = '';
+my $top_n = 1;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$wish_result_dir,
+                                "o:s"=>\$outfile,
+				"n:i"=>\$top_n,
+                                ) or &USAGE;
+&USAGE unless ($wish_result_dir &&  $outfile);
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+my %prediction = ();
+
+my @list_files = glob("$wish_result_dir/*/prediction*.list");
+logger("no prediction list found in dir $wish_result_dir", "ERROR") if (@list_files <= 0);
+my $npred = @list_files;
+
+logger("parse $npred wish results");
+foreach my $f (@list_files){
+	open IN, $f or die $!;
+	<IN>; # skip header
+	while(<IN>){
+		chomp;
+		next if (/^$/);
+		my ($virus, $host, $likelihood, $pvalue) = split /\s+/, $_;
+		push @{$prediction{$virus}}, [$host, $likelihood, $pvalue];
+	}
+	close IN;
+}
+
+#output top n
+logger("Output topN predictions");
+open O, ">$outfile" or die $!;
+
+print O join("\t", "phage", "host", "likelihood", "p-value"), "\n";
+
+foreach my $virus (sort {$a cmp $b} keys %prediction){
+	my $pred = $prediction{$virus};
+	my $ntargets = scalar @{$pred};
+	# sort by likelihood in descend order
+	my @sorted_idx = sort {$pred->[$b]->[1] <=> $pred->[$a]->[1]} 0..($ntargets-1),
+
+	my $max_idx = $ntargets > $top_n ? $top_n - 1 : $ntargets - 1;	
+	print O join("\t",
+		$virus,
+		join(",", (map{$pred->[$_]->[0]} @sorted_idx[0..$max_idx])),
+		join(",", (map{$pred->[$_]->[1]} @sorted_idx[0..$max_idx])),
+		join(",", (map{$pred->[$_]->[2]} @sorted_idx[0..$max_idx])),
+	), "\n";
+}
+close O;
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	gather WIsH results(run WIsH with db split)
+
+Usage:
+  Options:
+  -i    <dir>          input wish result dir, forced
+  -o    <file>         output file , forced
+  -n    <int>          out put top n predictions, default [$top_n]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

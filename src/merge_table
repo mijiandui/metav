@@ -1,0 +1,311 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $indir;
+my $database;
+my $structure_list;
+my $db_type;
+my $qcov = 75;
+my $min_len = 25;
+my $max_e = 1e-7;
+my $min_id = 80;
+
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$indir,
+                                "d:s"=>\$database,
+                                "l:s"=>\$structure_list,
+                                "qcov:i"=>\$qcov,
+                                "length:i"=>\$min_len,
+                                "e:f"=>\$max_e,
+                                "id:i"=>\$min_id,
+                                ) or &USAGE;
+&USAGE unless ($indir && $database && $structure_list);
+
+
+$indir = Cwd::abs_path($indir);
+$database = Cwd::abs_path($database);
+$structure_list = Cwd::abs_path($structure_list);
+
+
+# check existence of files 
+logger("database $database dose not exist", "ERROR") unless -e $database;
+logger("structure list $structure_list dose not exist", "ERROR") unless -e $structure_list;
+logger("input dir dose not exists", "ERROR") unless -d $indir;
+
+# check blastout and metadta
+
+my $blastout = "$indir/blastout.txt";
+my $metadata = "$indir/metadata.txt";
+
+logger("blastout <$blastout> dose not exist", "ERROR") unless -e $blastout;
+logger("metadata <$metadata> dose not exist", "ERROR") unless -e $metadata;
+
+###############
+# main
+###############
+logger("Running: $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+# load metadata
+my %meta = ();
+logger("Load meta data");
+load_meta_data($metadata, \%meta);
+
+my $nsamples = keys %meta;
+if ($nsamples == 0){
+    logger("no valid sample in metadta, nothing to do.");
+    goto END;
+}
+
+# determine database db_type
+if (-e "$database.pdb"){
+    $db_type = "prot";
+    $qcov /= 300.0;
+}elsif(-e "$database.ndb"){
+    $db_type = "nucl";
+    $qcov /= 100.0;
+    $min_len *=3;
+}else{
+    logger("Cannot find database <$database.*db>. Please run <make_db> first or check database (--database)", "ERROR");
+}
+
+# load structure list
+my %structure = ();
+my @levels = ();
+
+logger("Load structure list");
+load_structure_list($structure_list, \%structure, \@levels); 
+
+# parse blastout and aggregate multiple level statistics
+my %aln = ();
+{
+    logger("Parse blast output");
+    open I, "$blastout" or die $!;
+    #no header
+    while (<I>){
+        chomp;
+        next if (/^$/);
+        my ($qseqid, $sseqid, $pident, $length, $qlen, $slen, $evalue, $bitscore) = split /\s+/, $_;
+
+        # filter record
+        next if ($pident < $min_id || $evalue > $max_e || $length < $min_len || $length/$qlen < $qcov);
+
+        logger("Not all extracted target sequences can be found in the structure file. Please check the database and/or the structure files.", "WARN") unless (defined $structure{$sseqid});
+        
+        my ($sample, $iid) = $qseqid=~/^([^\@]+)\@(\d+)\@.*/;
+        logger("could not parse sample from seqid, <$qseqid>") unless (defined $sample);
+        logger("could not parse iid from seqid, <$qseqid>") unless (defined $iid);
+        $sample =~s/_1|_2//g;
+
+        #next unless (defined $meta{$sample});
+
+        my $best_hits = $aln{$sample}{$qseqid};
+        if (defined $best_hits){
+            next if ($evalue > $best_hits->[6]);
+
+            if ($evalue < $best_hits->[6] 
+                || ($evalue == $best_hits->[6] && $bitscore > $best_hits->[7]) 
+                || ($evalue == $best_hits->[6] && $bitscore == $best_hits->[7] && $length > $best_hits->[3])){
+                    
+                $aln{$sample}{$qseqid} = [$iid, $sseqid, $pident, $length, $qlen, $slen, $evalue, $bitscore];
+            }
+        }else{
+            $aln{$sample}{$qseqid} = [$iid, $sseqid, $pident, $length, $qlen, $slen, $evalue, $bitscore];
+        }
+    }
+    close I;
+
+    # stat all level base on hits
+    logger("summarize all level stats");
+    my %stat = ();
+    my @samples = sort {$a cmp $b} keys %meta;
+  
+    my @measures = ('scov', 'count', 'rpk');
+    foreach my $s (keys %aln){
+        foreach my $sid (keys %{$aln{$s}}){
+            my $hits = $aln{$s}{$sid};
+            my $level = $structure{$hits->[1]};
+            next unless defined $level;
+            foreach my $measure (0..$#measures) {
+                my $key = $measures[$measure];
+                my $val = 0;
+                if ($measure == 0){ #scov
+                    $val = $hits->[3] / $hits->[5];
+                }elsif($measure == 1){ # count
+                    $val = 1;
+                }else{ # rpk
+                    $val = 1 / $hits->[5] / 1000;
+                }
+                for (my $i = 0; $i < @levels; $i++){
+                    $stat{$key}{$levels[$i]}{$level->[$i]}{$s} += $val;
+                }
+            }
+        }
+    }
+
+    logger("output unnormalized metrics");
+    foreach my $measure (@measures[0..1]){
+        foreach my $level (keys %{$stat{$measure}}){
+            my $ofile = "$indir/unnormalized_$measure.$level.txt";
+            open O, ">$ofile" or die $!;
+            print O $level, "\t", join("\t", @samples), "\n";
+            my $tmp_hash = $stat{$measure}{$level};
+            foreach my $key (sort {$a cmp $b} keys %{$tmp_hash}){
+                print O $key, "\t", join("\t", (map {$tmp_hash->{$key}{$_}} @samples)), "\n";
+            }
+            close O;
+        }
+    }
+
+    logger("output normalized metrics");
+    my @name = ('normalized_cell', 'normalized_16S', 'ppm', 'rpkm');
+    my @normalizer = ('nCell', 'n16S', 'nRead', 'nRead');
+    my @measure_by_name = ('scov', 'scov', 'count', 'rpk');
+
+    for (my $i = 0; $i < @name; $i++){
+        foreach my $level(keys %{$stat{$measure_by_name[$i]}}){
+            my $ofile = "$indir/$name[$i].$level.txt";
+            open O, ">$ofile" or die $!;
+            print O $level, "\t", join("\t", @samples), "\n";
+            my $tmp_hash = $stat{$measure_by_name[$i]}{$level};
+            foreach my $key (sort {$a cmp $b} keys %{$tmp_hash}){
+                print O $key, "\t", join("\t", (map {
+                    my $val = $tmp_hash->{$key}{$_} / $meta{$_}{$normalizer[$i]};
+                    if ($name[$i] eq 'ppm' || $name[$i] eq 'rpkm'){
+                        $val *= 1e6;
+                    }
+                    $val
+                } @samples)), "\n";
+            }
+            close O;
+        }
+    }
+
+}
+
+END:
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub load_structure_list{
+    my $f = shift;
+    my $st = shift;
+    my $le = shift;
+
+    open I, "$f" or die $!;
+    
+    my $level =<I>;   chomp $level;
+    @{$le}  = split /\t+/, $level;
+    while(<I>){
+        chomp;
+        next if (/^$/);
+        my @cols = split /\t+/, $_;     
+        $st->{$cols[0]} = [@cols];
+    }
+    close I;
+}
+
+sub load_meta_data{
+    my $f = shift;
+    my $md = shift;
+
+    open I, "$f" or die $!;
+    while(<I>){
+        chomp;
+        next if (/^$/ or /^Sample/);
+
+        my ($sample, $nreads, $S16, $ncell) = split /\s+/, $_;
+        if ($nreads == 0 || $S16 == 0 || $ncell == 0){
+            logger("Found zero reads/16s/cells in metadata file <$f>.  Samples $sample will be ignored.", "WARN");
+            next;
+        }
+        $md->{$sample}{'nRead'} = $nreads;
+        $md->{$sample}{'n16S'} = $S16;
+        $md->{$sample}{'nCell'} = $ncell;
+
+    }
+    close I;    
+}
+
+sub run {
+    my $cmd = shift;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s");
+
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	merge table for one sample
+
+Usage:
+  Options:
+  -i    <dir>           input dir , forced
+  -d    <file>          database fa, forced
+  -l    <file>          structure list file, forced
+  --qcov   <int>        qcov, [$qcov]
+  --length <int>        min length of blast hits, [$min_len]
+  --e      <float>      max e of blast hits, [$max_e]
+  --id     <int>        min identity, default [$min_id]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

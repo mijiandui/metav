@@ -1,0 +1,146 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $input;
+my $output;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$input,
+                                "o:s"=>\$output,
+                                ) or &USAGE;
+&USAGE unless ($input && $output);
+
+
+
+###############
+# main
+###############
+logger("Running: $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+open IN, $input or die $!;
+open O, ">$output" or die $!;
+
+my $header = <IN>;
+my @h = split /\t+/, $header;
+
+my @new_h = @h[0..@h-2];
+push @new_h, ("Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+
+
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	my @cols = split /\t+/, $_;
+
+	my $tax = $cols[$#cols];
+	my @tax = split /;/, $tax;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+#Virus;Realm;Kingdom;Phylum;Class;Order;Family;Subfamily;Genus
+#Viruses;-viria;-virae;-viricota;-viricetes;-virales;-viridae;-virinae;-virus
+	foreach (@tax){
+		if (/^Viruses$/){
+			$new_tax[0] = $_;
+		}
+		elsif(/viria$/){
+			$new_tax[1] = $_;
+		}
+		elsif(/viriae$/){
+			$new_tax[2] = $_;
+		}
+		elsif(/viricota$/){
+			$new_tax[3] = $_;
+		}
+		elsif(/viricetes$/){
+			$new_tax[4] = $_;
+		}
+		elsif(/virales$/){
+			$new_tax[5] = $_;
+		}
+		elsif(/viridae$/){
+			$new_tax[6] = $_;
+		}
+		elsif(/virinae$/){
+			$new_tax[7] = $_;
+		}
+		elsif(/virus$/){
+			$new_tax[8] = $_;
+		}
+	}
+	#$cols[$#cols] = join(";", @new_tax);
+	print O join("\t", @cols[0..@cols-2], @new_tax), "\n";
+}
+
+close IN;
+close O;
+
+
+END:
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	format genomad taxonomy file
+
+Usage:
+  Options:
+  -i    <file>           input file , forced
+  -o    <file>           output file, forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

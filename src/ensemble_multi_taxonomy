@@ -1,0 +1,217 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my @inputs;
+my $level = "Family";
+my $output;
+my $ictv_table;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s{,}"=>\@inputs,
+                                "o:s"=>\$output,
+                                "ictv:s"=>\$ictv_table,
+                                "l:s"=>\$level,
+                                ) or &USAGE;
+&USAGE unless (@inputs && $output && $ictv_table);
+
+
+
+###############
+# main
+###############
+logger("Running: $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+
+my %family2class = ();
+logger("loading ictv table");
+
+open IN, "$ictv_table" or die $!;
+
+<IN>;
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	my @cols = split /\t/, $_;
+	next if ($cols[5] eq "");
+
+	$family2class{$cols[5]} = $cols[3] eq "" ? "Unclassified" : $cols[3];
+}
+
+close IN;
+
+
+my %ensemble = ();
+
+foreach my $file (@inputs){
+
+    add_tax_source($file, \%ensemble, $level, \%family2class);
+}
+
+#print Dumper %ensemble; die;
+sub priority {
+	my $softwares = shift;
+	foreach my $i (@$softwares){
+		my $f = $i->[0];
+		if ($f eq "genomad"){
+			return 7;
+		}	
+		if ($f eq "blastn"){
+			return 6;
+		}	
+		if ($f eq "vcontact2"){
+			return 5;
+		}	
+		if ($f eq "cat"){
+			return 4;
+		}	
+		if ($f eq "kaiju"){
+			return 3;
+		}	
+		if ($f eq "demovir"){
+			return 2;
+		}	
+		if ($f eq "phagcn"){
+			return 1;
+		}	
+	}
+}
+
+sub get_class {
+  my $x = shift;
+  foreach my $xi (@$x){
+	  if ($xi->[1] ne "Unclassified" && $xi->[1] ne "Unassigned"){
+	  	return $xi->[1];
+	  }
+  }
+  return "Unclassified";
+
+}
+
+open O, ">$output" or die $!;
+print O "Contig\tClass\t$level\tNcall\tMethods\tnum_Other\tdetail_Other\n";
+
+foreach my $ctg (sort keys %ensemble){
+       	my @all = sort {scalar(@{$ensemble{$ctg}{$b}}) <=> scalar(@{$ensemble{$ctg}{$a}}) or priority(\@{$ensemble{$ctg}{$b}}) <=> priority(\@{$ensemble{$ctg}{$a}})} keys %{$ensemble{$ctg}};
+	my ($max_vote_tax) = $all[0];
+	my $n = scalar(@{$ensemble{$ctg}{$max_vote_tax}});
+	my $class = get_class(\@{$ensemble{$ctg}{$max_vote_tax}});
+	my $details = "";
+	foreach my $k(@all){
+		$details .= "$k|".join(",", (map{$_->[0]}@{$ensemble{$ctg}{$k}}))."|".join(",", (map{$_->[1]}@{$ensemble{$ctg}{$k}})).";";
+	}
+	print O join("\t", $ctg, $class, $max_vote_tax, $n, join(",", (map {$_->[0]} @{$ensemble{$ctg}{$max_vote_tax}})), scalar(@all), $details), "\n";
+}
+
+
+
+close O;
+
+
+END:
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub add_tax_source{
+
+	my $f = shift;
+	my $h = shift;
+	my $l = shift;
+	my $db = shift;
+
+	open IN, $f or die $!;
+
+	my $header = <IN>; chomp $header;
+
+	my @h = split /\s+/, $header;
+	my %level;
+	for (my $i = 2; $i < @h; $i++){
+		$level{$h[$i]} = $i - 2;
+	}
+	if (not defined $level{$l}){
+		logger("please specify correct taxonomy level", "ERROR");
+	}
+	$l = $level{$l};
+
+	while (<IN>){
+		chomp;
+		next if (/^$/ or /^\#/);
+
+		my ($src, $contig, @tax) = split /\s+/, $_;
+
+		my $class = $tax[$l-2];
+		if (defined $db->{$tax[$l]}){
+			$class = $db->{$tax[$l]};
+		}
+		next if ($tax[$l] eq "Unclassified" && $class eq "Unclassified");
+		push @{$h->{$contig}{$tax[$l]}}, [$src, $class];
+	}
+
+	close IN;
+}
+
+
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	format  taxonomy file
+
+Usage:
+  Options:
+  -i    <files>          input file , forced
+  -ictv <file>           ictv table, forced
+  -o    <file>           output file, forced
+  -l    <str>            taxonomy level, {Virus   Realm   Kingdom Phylum  Class   Order   Family  Subfamily       Genus}, forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

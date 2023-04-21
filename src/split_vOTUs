@@ -1,0 +1,129 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $contig_file;
+my $outdir = '';
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$contig_file,
+                                "o:s"=>\$outdir,
+                                ) or &USAGE;
+&USAGE unless ($contig_file &&  $outdir);
+
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+dumper_viral_contig($contig_file, $outdir);
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+
+sub dumper_viral_contig {
+    my $in = shift;
+    my $out = shift;
+
+    open IN, $in or die $!;
+    local $/=">";
+    my $n = 0;
+    while (<IN>){
+	chomp;
+	next if (/^$/);
+	my ($id, @lines) = split /\n/, $_;
+	($id) = split /\s+/, $id;
+	
+	my $ofile = "$out/$id.fa";
+	open O, ">$ofile" or die $!;
+	print O ">$_";
+	close O;
+	$n++;
+	logger("processed $n sequence") if ($n % 100000 == 0);
+    }
+    close IN;
+    logger("processed $n sequence");
+    $/="\n";
+}
+
+sub run {
+    my $cmd = shift;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s");
+    logger("CMD Done.");
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	split fa, one file per seq
+
+Usage:
+  Options:
+  -i    <file>          input contig FASTA file, forced
+  -o    <dir>           output dir , forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

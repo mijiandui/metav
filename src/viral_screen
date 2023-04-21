@@ -1,0 +1,306 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $contig_file;
+my $virsort2_score_table;
+my $checkv_contamination_table;
+my $deepvirfinder_score_table;
+my $outdir = '';
+my $prefix;
+my $min_len = 1500;
+my $dvf_score = 0.95;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$contig_file,
+                                "s:s"=>\$virsort2_score_table,
+                                "c:s"=>\$checkv_contamination_table,
+                                "d:s"=>\$deepvirfinder_score_table,
+                                "z:s"=>\$dvf_score,
+                                "o:s"=>\$outdir,
+                                "p:s"=>\$prefix,
+                                ) or &USAGE;
+&USAGE unless ($contig_file &&  $virsort2_score_table && $checkv_contamination_table && $prefix);
+
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+
+my %category = ();
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+logger("Load checkv contamination table");
+load_checkv_contanmination_table($checkv_contamination_table, \%category);
+
+logger("Load virsorter2 score table");
+load_virsort_score_table($virsort2_score_table, \%category);
+
+my $has_dvf_screen = 0;
+if (defined $deepvirfinder_score_table && -e $deepvirfinder_score_table){
+    logger("Load DeepVirFiner score table");
+    load_dvf_score_table($deepvirfinder_score_table, \%category, $dvf_score);
+    $has_dvf_screen = 1;
+}
+
+logger("Dumper virsorter2&checkv screening details");
+my $details_file = $has_dvf_screen ? "$outdir/$prefix.vs2.dvf.screened.tsv" : "$outdir/$prefix.vs2.checkv.screened.tsv";
+dumper_screened_details(\%category, $details_file);
+
+logger("Dumper viral contigs");
+my $final_viral_contigs = "$outdir/$prefix.final-viral.contigs.fasta";
+my $contigs_to_check = "$outdir/$prefix.mannual_check.contigs.fasta";
+dumper_viral_contig($contig_file, $final_viral_contigs, $contigs_to_check, \%category);
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub load_dvf_score_table {
+    my $tsv = shift;
+    my $cat = shift;
+    my $min_score = shift;
+
+    open IN, "$tsv" or die $!;
+    my $h =<IN>; chomp $h;
+    my @h = split /\s+/, $h;
+    die "DeepVirFinder table format error, expect 4 columns, actually ".scalar(@h)." columns.\n" if (@h != 4);
+
+    while(<IN>){
+    	chomp;
+        next if (/^$/);
+        my ($contig_id, $contig_length, $score, $pvalue) = split /\t+/, $_;
+        ($contig_id) = split /\s+/, $contig_id;
+        
+        my $ctg_info = $cat->{$contig_id};
+
+        if (defined $ctg_info){
+            $ctg_info->[5] = $score;
+            $ctg_info->[6] = $pvalue;
+
+            if ($score >= $dvf_score){
+                if ($ctg_info->[7] =~/Keep/){
+                    $ctg_info->[7] .="&DeepVirFinder";
+                }else{
+                    $ctg_info->[7] = "DeepVirFinder";
+                }
+            }
+        }else{
+            $cat->{$contig_id} = [$contig_length, 'NA', 'NA', 'NA', 'NA', $score, $pvalue, 'Discard'];
+            if ($score >= $dvf_score){
+                $cat->{$contig_id}->[7] = "DeepVirFinder";
+            }
+        }
+
+    }
+    close IN;
+}
+
+sub dumper_viral_contig {
+    my $in = shift;
+    my $out = shift;
+    my $mcheck = shift;
+    my $cat = shift;
+
+    open IN, $in or die $!;
+    open OUT, ">$out" or die $!;
+    open MCK, ">$mcheck" or die $!;
+    $/=">";
+    while (<IN>){
+	chomp;
+	next if (/^$/);
+	my ($id, @lines) = split /\n/, $_;
+	($id) = split /\s+/, $id;
+	my $ctg_info = $cat->{$id};
+	if (defined $ctg_info){
+	    print OUT ">",$_ if ($ctg_info->[7]=~/Keep/ || $ctg_info->[7]=~/DeepVirFinder/);
+	    print MCK ">",$_ if $ctg_info->[7]=~/^M/; # Mannual check
+	}
+    }
+    close IN;
+    close OUT;
+    close MCK;
+    $/="\n";
+}
+
+sub dumper_screened_details{
+    my $cat = shift;
+    my $ofile = shift;
+
+    open O, ">$ofile" or die $!;
+
+    print O join("\t", qw(contig_id length  viral_genes  host_genes score hallmark  dvf_score  dvf_pvalue category)), "\n";
+    foreach my $ctg (sort {$cat->{$b}->[0] <=> $cat->{$a}->[0] or $a cmp $b} keys %{$cat}){
+	print O join("\t", $ctg, @{$cat->{$ctg}}), "\n";
+    }
+    close O;
+}
+
+sub load_virsort_score_table{
+    my $score_tsv = shift;
+    my $cat = shift;
+
+
+    open IN, "$score_tsv" or die $!;
+    my $h =<IN>; chomp $h;
+    my @h = split /\s+/, $h;
+    my %col_id = ();
+    for (my $i = 0; $i < @h; $i++){
+	$col_id{$h[$i]} = $i;
+    }
+    # check header
+    die "virsorter2 score table format error, no 'seqname' field\n" unless defined $col_id{'seqname'};
+    die "virsorter2 score table format error, no 'max_score' field\n" unless defined $col_id{'max_score'};
+    die "virsorter2 score table format error, no 'hallmark' field\n" unless defined $col_id{'hallmark'};
+    die "virsorter2 score table format error, no 'length' field\n" unless defined $col_id{'length'};
+
+    my $ctg_id_col = $col_id{'seqname'};
+    my $score_col = $col_id{'max_score'};
+    my $hallmark_col = $col_id{'hallmark'};
+    my $length_col = $col_id{'length'};
+
+    while(<IN>){
+    	chomp;
+	next if (/^$/);
+   
+	my @cols = split /\s+/, $_;
+	my ($contig_id) = $cols[$ctg_id_col] =~/(\S+)\|\|.*$/;
+        die "contig id format error, no '||' seperator\n" unless defined $contig_id;	
+
+	my $ctg_info = $cat->{$contig_id};
+
+	unless (defined $ctg_info){
+	   logger("$contig_id dose not exist in checkv contamination table, label as 'Discard'");
+	   $cat->{$contig_id} = [$cols[$length_col], 'NA', 'NA', $cols[$score_col], $cols[$hallmark_col], 'Discard']; # for score and hallmark
+	   next;
+	}
+
+	# relabel contig
+	$ctg_info->[3] = $cols[$score_col];    # max_score
+	$ctg_info->[4] = $cols[$hallmark_col]; # hallmark
+
+	if ($ctg_info->[7] ne 'Keep1'){
+	    if ($ctg_info->[1] == 0 && ($ctg_info->[2] == 0 || $ctg_info->[3] >= 0.95 || $ctg_info->[4] > 2)){
+		    $ctg_info->[7] = 'Keep2';
+	    }elsif($ctg_info->[1] == 0 && $ctg_info->[2] == 1 && $ctg_info->[0] >= 10000){
+		    $ctg_info->[7] = 'MannualCheck';
+	    }else{
+		    $ctg_info->[7] = 'Discard';
+	    }
+	}
+    }
+    close IN;
+
+}
+
+sub load_checkv_contanmination_table {
+    my $tsv = shift;
+    my $cat = shift;
+
+    open IN, "$tsv" or die $!;
+    my $h =<IN>; chomp $h;
+    my @h = split /\s+/, $h;
+    die "checkv contamination table format error, expect 14 columns, actually ".scalar(@h)." columns.\n" if (@h != 14);
+
+    while(<IN>){
+    	chomp;
+        next if (/^$/);
+        my ($contig_id, $contig_length, $total_genes, $viral_genes, $host_genes, @extra_infos) = split /\s+/, $_;
+        ($contig_id) = $contig_id =~/(\S+)\|\|.*$/;
+            die "contig id format error, no '||' seperator\n" unless defined $contig_id;	
+        if ($viral_genes > 0){
+            $cat->{$contig_id} = [$contig_length, $viral_genes, $host_genes, undef, undef, 'NA', 'NA', 'Keep1']; # undef for score and hallmark
+        }elsif($viral_genes == 0){
+            $cat->{$contig_id} = [$contig_length, $viral_genes, $host_genes, undef, undef, 'NA', 'NA', 'MayBeKeep2']; # candidate Keep2
+        }
+    }
+    close IN;
+}
+
+
+sub run {
+    my $cmd = shift;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s");
+    logger("CMD Done.");
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+    Scripts to do viral screening base on virsorter2 and checkv results.
+
+    Keep1: viral_gene > 0
+    Keep2: viral_gene = 0 AND (host_gene = 0 OR score >= 0.95 OR hallmark > 2)
+    DeepVirFinder: score >= $dvf_score
+
+Usage:
+  Options:
+  -i    <file>          input contig FASTA file, forced
+  -s    <file>          virsorter2 score tsv , forced
+  -c    <file>          checkv contamination table , forced
+  -d    <file>          deepvirfiner score table, optional
+  -o    <dir>           output dir , forced
+  -p    <str>           prefix of output file , forced
+  -z                    minimal DeepVirFinder's score to be identified as viral contig, default [$dvf_score]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

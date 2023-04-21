@@ -1,0 +1,140 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $clusters;
+my $outfile = '';
+my @db_list = ("PVD", "GPD", "GVD", "IMGVR4", "MGV");
+my %db_idx = (
+	"PVD" => 0, 
+	"GPD" => 1, 
+	"GVD" => 2,
+	"IMGVR4" => 3, 
+	"MGV" => 4,
+);
+my @db_regex = ("^vOTU", "^ivig|^uvig", "NODE", "^IMGVR", "MGV");
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$clusters,
+                                "o:s"=>\$outfile,
+                                ) or &USAGE;
+&USAGE unless ($clusters &&  $outfile);
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+open IN, $clusters or die $!;
+open O, ">$outfile" or die $!;
+print O join("\t", ("ID", @db_list)), "\n";
+
+my $vc_id = 0;
+while(<IN>){
+    chomp;
+
+    my ($id, $cid) = split /\s+/, $_;
+    my @ids = split /,/, $cid;
+
+    my @c = (0, 0, 0, 0, 0);
+    foreach my $x (@ids){
+    	my $db = get_db($x);
+	logger("can not get db from id $x", "ERROR") if $db eq "NA";
+	$c[$db_idx{$db}]++;
+    }
+
+    print O join("\t", ("VC$vc_id", @c)), "\n";
+
+    $vc_id++;
+}
+
+close O;
+close IN;
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub get_db {
+    my $id = shift;
+    #my @db_regex = ("^vOTU", "^ivig|^uvig", "NODE", "^IMGVR", "MGV");
+    #my @db_list = ("PVD", "GPD", "GVD", "IMGVR4", "MGV");
+    
+    if ($id =~/^vOTU/){
+	    return "PVD";
+    }
+    if ($id =~/^ivig/ || $id=~/^uvig/){
+	    return "GPD";
+    }
+    if ($id =~/^IMGVR/){
+	    return "IMGVR4";
+    }
+    if ($id =~/^MGV/){
+	    return "MGV";
+    }
+    if ($id =~/NODE/){
+	    return "GVD";
+    }
+    
+    return "NA";
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+
+	prepare upset input data from database clusters 
+Usage:
+  Options:
+  -i    <file>         cluster file, forced
+  -o    <file>         output file, forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

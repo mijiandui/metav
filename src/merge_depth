@@ -1,0 +1,163 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $input_dir;
+my $contig_list;
+my $outfile = '';
+my $min_contig_len = 3000;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$input_dir,
+                                "c:s"=>\$contig_list,
+                                "o:s"=>\$outfile,
+                                "l:i"=>\$min_contig_len,
+                                ) or &USAGE;
+&USAGE unless ($input_dir &&  $contig_list && $outfile);
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+my @list_files = glob("$input_dir/*.depth.txt");
+logger("no prediction list found in dir $input_dir", "ERROR") if (@list_files <= 0);
+my $nsamples = @list_files;
+
+my @samples = ();
+foreach my $f (@list_files){
+	my $sample = basename $f;
+	$sample =~s/\.depth\.txt//g;
+	push @samples, $sample;
+}
+
+# load contig list gt than 3000
+logger("load contig list");
+my $ctg_id = 0;
+my %contigs = ();
+my @contigs = ();
+open IN, $contig_list or die $!;
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	$contigs{$_} = $ctg_id;
+	$ctg_id++;
+	push @contigs, $_;
+}
+close IN;
+
+# prealloc memory for large array
+# require memory: nsample * ncontig * 2 * 8 
+
+logger("prealloc memory");
+my @depth = ();
+my $total_size = @samples * @contigs * 2;
+for(my $i = $total_size - 1; $i >= 0; $i--){
+	$depth[$i] = 0.0;  # last
+}
+
+my $ncols = 2 * @samples;
+logger("parse $nsamples depth results");
+for(my $i = 0; $i < $nsamples; $i++){
+	logger("processed $i/$nsamples samples") if ($i % 10 == 0);
+
+	open IN, $list_files[$i] or die $!;
+	<IN>; # skip header
+	while(<IN>){
+		chomp;
+		next if (/^$/);
+		my ($contig, $len, $avg, $d, $var) = split /\s+/, $_;
+		next if $len < $min_contig_len;
+		next unless defined $contigs{$contig};
+		
+		my $idx = $contigs{$contig} * $ncols + 2 * $i;
+		$depth[$idx] = $d;
+		$depth[$idx + 1] = sqrt($var);
+	}
+	close IN;
+
+}
+
+#output top n
+logger("Output merged result");
+open O, ">$outfile" or die $!;
+
+print O join("\t", "scaffold",(map {("avg_".$_, "stdev_".$_)} @samples)), "\n";
+
+my $total_contigs = @contigs;
+
+for(my $i = 0; $i < $total_contigs; $i++){
+	logger("processed $i/$total_contigs vOTUs") if ($i % 1000 == 0);
+
+	my $start = $i * $ncols;
+	my $end = $start + $ncols - 1;	
+	print O join("\t", $contigs[$i], @depth[$start..$end]), "\n";
+	
+}
+close O;
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	merge depth result from metabat2 and convert to vRhyme required format
+
+Usage:
+  Options:
+  -i    <dir>          input depth result dir, forced
+  -c    <file>         contig list, forced
+  -o    <file>         output file , forced
+  -l    <int>          min contig length, default [$min_contig_len]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

@@ -1,0 +1,383 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $input;
+my $output;
+my $input_format;
+
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$input,
+                                "o:s"=>\$output,
+                                "f:s"=>\$input_format,
+                                ) or &USAGE;
+&USAGE unless ($input && $output && $input_format);
+
+
+
+###############
+# main
+###############
+logger("Running: $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+
+open IN, $input or die $!;
+open O, ">$output" or die $!;
+
+if ($input_format eq "genomad"){
+
+my $header = <IN>;
+my @h = split /\t+/, $header;
+
+my @new_h = @h[0..@h-2];
+push @new_h, ("Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+
+
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	my @cols = split /\t+/, $_;
+
+	my $tax = $cols[$#cols];
+	my @tax = split /;/, $tax;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+#Virus;Realm;Kingdom;Phylum;Class;Order;Family;Subfamily;Genus
+#Viruses;-viria;-virae;-viricota;-viricetes;-virales;-viridae;-virinae;-virus
+	assign_tax(\@tax, \@new_tax);
+	#$cols[$#cols] = join(";", @new_tax);
+	print O join("\t", @cols[0..@cols-2], @new_tax), "\n";
+}
+}
+elsif($input_format eq "kaiju"){
+#C       vOTU_130454|k79_1392872@3800-19M_DME23300-V|1   4024134529      Duplodnaviria; Heunggongvirae; Uroviricota; Caudoviricetes; Astrithrvirus; Astrithrvirus astrithr; Salmonella phage astrithr;
+#U       vOTU_1346310|k79_803760@3800-19M_DME23300-V|1   0
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	
+	my @cols = split /\t+/, $_;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+	if ($cols[0] eq "U" || ($cols[0] eq "C" && not defined $cols[3])){
+		#print O join("\t", $input_format, $cols[1], @new_tax), "\n";
+		next;
+	}
+	my @tax = split /;/, $cols[3];
+	for(my $i = 0; $i < @tax; $i++){
+	    $tax[$i] =~s/^\s+//g;
+	}
+	assign_tax(\@tax, \@new_tax);
+	print O join("\t", $input_format, $cols[1], @new_tax), "\n";
+}
+
+}
+elsif($input_format eq "demovir"){
+#Sequence_ID     Order   Percent_of_votes        Family  Percent_of_votes
+#vOTU_0|k79_3759@SRR11126256|32  no_order_Peduoviridae   48.2919254658385        Peduoviridae    48.2170542635659
+#vOTU_1|k79_3761@SRR11126256|34  no_order_Peduoviridae   48.8023952095808        Peduoviridae    48.8755622188906
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+<IN>;
+while(<IN>){
+	chomp;
+	next if (/^$/);
+	my @cols = split /\s+/, $_;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+	if ($cols[1] !~/^no_order/){
+		$new_tax[5] = $cols[1];
+	}
+	$new_tax[6] = $cols[3];
+	print O join("\t", $input_format, $cols[0], @new_tax), "\n";
+
+}
+}
+elsif ($input_format eq "cat"){
+	# contig^Iclassification^Ireason^Ilineage^Ilineage scores^Isuperkingdom^Iphylum^Iclass^Iorder^Ifamily^Igenus^Ispecies$
+	#vOTU_0|k79_3759@SRR11126256|32^Itaxid assigned^Ibased on 367/893 ORFs^I1;1310476219;3385914592;594902272;841832847;3582890323;1568818424;172183911;1022413311*^I1.00;0.98;0.98;0.98;0.98;0.82;0.81;0.81;0.81^INA^IUroviricota: 0.98^ICaudoviricetes: 0.98^INA^IPeduoviridae: 0.82>
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+#<IN>;
+while(<IN>){
+	chomp;
+	next if (/^$/ or /^\#/);
+	my @cols = split /\t+/, $_;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+	if ($cols[1] eq 'no taxid assigned'){
+		#print O join("\t", $cols[0], @new_tax), "\n";
+		next;
+	}
+	my @tax = @cols[5..$#cols];
+	for (my $i = 0; $i < @tax; $i++){
+		($tax[$i]) = split /:/, $tax[$i];
+	}
+	assign_tax(\@tax, \@new_tax);
+	print O join("\t", $input_format, $cols[0], @new_tax), "\n";
+
+}
+}
+elsif($input_format eq "phagcn"){
+	#contig_name,idx,prediction,score
+	#vOTU_22552|k79_379835@3800-19M_DME23300-V|161,0_0,Drexlerviridae,0.29527813
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+<IN>;
+while(<IN>){
+	chomp;
+	next if (/^$/ or /^\#/);
+	my @cols = split /,/, $_;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+	assign_tax([$cols[2]], \@new_tax);
+	print O join("\t", $input_format, $cols[0], @new_tax), "\n";
+
+}
+
+}
+
+elsif($input_format eq "blastn"){
+	#Name    UViG2   Sequence_identity       QLength mismatches      Gap_openings    Query_start     Query_end       Target_start    Target_end      E-value Bit_score       qcovs   qcovhsp qcovus  UVIG    Taxon_oid       Scaffold_oid    Coordinates ('whole' if the UViG is the entire contig)    Ecosystem classification        vOTU    Length  Topology        geNomad score   Confidence      Estimated completeness  Estimated contamination MIUViG quality  Gene content (total genes;cds;tRNA;geNomad marker)      Taxonomic classification        Taxonomic classification method   Host taxonomy prediction        Host prediction method  Sequence origin (doi)
+	#vOTU_2980969|k79_464087@3800-19M_DME23300-V|1   IMGVR_UViG_3300045988_115046|3300045988|Ga0495776_092651        99.305  1582    11      0       1       1582    14614   16195   0       2861    100     100     100     IMGVR_UViG_3300045988_115046    3300045988      Ga0495776_092651  whole   Host-associated;Mammals: Human;Digestive system;Large intestine vOTU_07968422   101893  Linear  0.9778  High-confidence 90.92   0       High-quality    131;131;0;49    r__Duplodnaviria;k__Heunggongvirae;p__Uroviricota;c__Caudoviricetes;;;; geNomad ;;;;;;            geNomad v1.1.0 (10.5281/zenodo.7015982)
+
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+
+my $h = <IN>; chomp $h;
+my @h = split /\t+/, $h;
+my $tax_col = -1;
+for(my $i = 0; $i < @h; $i++){
+	if ($h[$i] =~/^Taxonomic classification$/){
+		$tax_col = $i;
+		last;
+	}
+}
+logger("FOrmat error, no 'Taxonomic classification' field", "ERROR") if ($tax_col == -1);
+while(<IN>){
+	chomp;
+	next if (/^$/ or /^\#/);
+	my @cols = split /\t/, $_;
+	my @new_tax = ();
+	for(1..9){
+		push @new_tax, "Unclassified";
+	}
+	my $tax = $cols[$tax_col];
+	my @tax = split /;/, $tax;
+	@tax = grep {$_ ne ""} @tax;
+	for(my $i = 0; $i < @tax; $i++){
+		($tax[$i]) = (split /__/, $tax[$i])[1];
+	}
+
+	assign_tax(\@tax, \@new_tax);
+	print O join("\t", $input_format, $cols[0], @new_tax), "\n";
+
+}
+
+}
+elsif($input_format eq "vcontact2"){
+	#Genome,Kingdom,Phylum,Class,Order,Family,Genus,preVC,VC Status,VC,VC Size,Quality,Adjusted P-value,VC Avg Distance,Topology Confidence Score,Genus Confidence Score,VC Kingdoms,VC Phyla,VC Classes,VC Orders,VC Families,VC Genera
+my %vc2tax = ();
+
+# determine vc's taxonomy using majority rules
+open IN2, $input or die $!;
+while(<IN2>){
+	chomp;
+	next if (/^$/ or /^\#/);
+	my @cols = split /,/, $_;
+
+	next if ($cols[0]=~/^vOTU/);
+	if (defined $cols[9] && $cols[9] ne "" && $cols[0] !~/^vOTU/){
+		push @{$vc2tax{$cols[9]}}, [@cols[1..6]];
+		next;
+	}
+}
+close IN2;
+
+foreach my $vc (keys %vc2tax){
+	my %genus = ();
+	foreach my $tax(@{$vc2tax{$vc}}){
+		my ($k, $p, $c, $o, $f, $g) = @{$tax};
+		next if (
+			$k eq "Unassigned" 
+		     && $p eq "Unassigned" 
+		     && $c eq "Unassigned" 
+		     && $o eq "Unassigned" 
+		     && $f eq "Unassigned" 
+		     && $g eq "Unassigned" 
+		);
+		$genus{'k'}{$k}++;
+		$genus{'p'}{$p}++;
+		$genus{'c'}{$c}++;
+		$genus{'o'}{$o}++;
+		$genus{'f'}{$f}++;
+		$genus{'g'}{$g}++;
+	}
+	$vc2tax{$vc} = [
+	    scalar(keys %{$genus{'k'}}) == 1 ?  (keys %{$genus{'k'}})[0] : "Unassigned",
+	    scalar(keys %{$genus{'p'}}) == 1 ?  (keys %{$genus{'p'}})[0] : "Unassigned",
+	    scalar(keys %{$genus{'c'}}) == 1 ?  (keys %{$genus{'c'}})[0] : "Unassigned",
+	    scalar(keys %{$genus{'o'}}) == 1 ?  (keys %{$genus{'o'}})[0] : "Unassigned",
+	    scalar(keys %{$genus{'f'}}) == 1 ?  (keys %{$genus{'f'}})[0] : "Unassigned",
+	    scalar(keys %{$genus{'g'}}) == 1 ?  (keys %{$genus{'g'}})[0] : "Unassigned",
+	];
+}
+
+
+#print Dumper %vc2tax; die;
+
+my @new_h = ("source", "vOTU_id", "Virus", "Realm", "Kingdom", "Phylum", "Class", "Order", "Family", "Subfamily", "Genus");
+print O join("\t", @new_h), "\n";
+<IN>;
+while(<IN>){
+	chomp;
+	next if (/^$/ or /^\#/);
+	my @cols = split /,/, $_;
+
+	if ($cols[0] !~/^vOTU/){
+		#$vc2tax{$cols[9]} = [@cols[1..6]];
+		next;
+	}
+
+	if ($cols[0]=~/^vOTU/){
+		if (defined $cols[9] && $cols[9] ne ""){
+			if (defined $vc2tax{$cols[9]}){
+				my @new_tax = ();
+				for(1..9){
+					push @new_tax, "Unclassified";
+				}
+				assign_tax($vc2tax{$cols[9]}, \@new_tax);
+				print O join("\t", $input_format, $cols[0], @new_tax), "\n";
+				
+			}
+		}else{
+			#logger("contig $cols[0] in VC $cols[9] unassigned");
+		}
+	}
+}
+
+}
+else{
+	logger("Unknown input format", "ERROR");
+}
+
+close IN;
+close O;
+
+
+
+END:
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+sub assign_tax {
+	my $tax = shift;
+	my $new_tax = shift;
+
+	foreach (@$tax){
+		if (/^Viruses$/){
+			$new_tax->[0] = $_;
+		}
+		elsif(/viria$/){
+			$new_tax->[1] = $_;
+		}
+		elsif(/viriae$/){
+			$new_tax->[2] = $_;
+		}
+		elsif(/viricota$/){
+			$new_tax->[3] = $_;
+		}
+		elsif(/viricetes$/){
+			$new_tax->[4] = $_;
+		}
+		elsif(/virales$/){
+			$new_tax->[5] = $_;
+		}
+		elsif(/viridae$/){
+			$new_tax->[6] = $_;
+		}
+		elsif(/virinae$/){
+			$new_tax->[7] = $_;
+		}
+		elsif(/virus$/){
+			$new_tax->[8] = $_;
+		}
+	}
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	format  taxonomy file
+
+Usage:
+  Options:
+  -i    <file>           input file , forced
+  -o    <file>           output file, forced
+  -f    <str>            input format, {genomad, kaiju, demovir, cat, phagcn, blastn, vcontact2}, forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

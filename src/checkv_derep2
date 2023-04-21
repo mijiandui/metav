@@ -1,0 +1,459 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+
+my $contig_file;
+my $contig_file_list;
+my $outdir = './';
+my $checkv_database;
+my $prefix;
+my $nthreads = 2;
+my $min_ani = 95;
+my $min_tcov = 85;
+my $min_qcov = 0;
+my $nparts = 50;
+my $step = 1;
+my $max_step = 8;
+my $only_one_step;
+my $conda_env = "vs2";
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$contig_file,
+                                "l:s"=>\$contig_file_list,
+                                "d:s"=>\$checkv_database,
+                                "o:s"=>\$outdir,
+                                "p:s"=>\$prefix,
+                                "ani:i"=>\$min_ani,
+                                "tc:i"=>\$min_tcov,
+                                "qc:i"=>\$min_qcov,
+                                "t:i"=>\$nthreads,
+                                "n:i"=>\$nparts,
+                                "s:i"=>\$step,
+                                "m:i"=>\$max_step,
+                                "one-step"=>\$only_one_step,
+                                "conda_env"=>\$conda_env,
+                                ) or &USAGE;
+&USAGE unless (($contig_file or $contig_file_list) && $prefix);
+
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+$outdir = Cwd::abs_path($outdir);
+
+if (defined $contig_file) {
+    $contig_file = Cwd::abs_path($contig_file);
+    logger("contig file dose not exist: $contig_file", "ERROR") unless -e $contig_file;
+}
+
+if (defined $contig_file_list) {
+    $contig_file_list = Cwd::abs_path($contig_file_list);
+    logger("contig file dose not exist: $contig_file_list", "ERROR") unless -e $contig_file_list;
+}
+
+logger("checkv database is missing", "ERROR") if ($max_step >= 7 && not defined $checkv_database);
+
+###############
+# check env
+###############
+my $home_dir = $ENV{HOME};
+my $conda_sh = "$home_dir/miniconda3/etc/profile.d/conda.sh";
+logger("conda sh not found: $conda_sh", "ERROR") unless -e $conda_sh;
+
+my $parallel = check_dep("parallel");
+my $makeblastdb = check_dep("makeblastdb");
+my $blastn = check_dep("blastn");
+my $anicalc = "$Bin/../third_party_tools/checkv/scripts/anicalc.py";
+logger ("anicalc.py: $anicalc not found", "ERROR") unless -e $anicalc;
+my $aniclust = "$Bin/../third_party_tools/checkv/scripts/aniclust.py";
+logger ("aniclust.py: $aniclust not found", "ERROR") unless -e $aniclust;
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+my $cmd;
+my $elapsed_time;
+my $id_renamed_contig_file = "$outdir/$prefix.rename_id.contigs.fa";
+
+# rename contig id fasta
+if ($step == 1){
+  logger("rename contig_id");
+  rename_contig_id($contig_file, $contig_file_list);
+  
+  $elapsed_time = time - $stime;
+  logger("Rename contig id done in $elapsed_time s");
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+# make blastn database
+my $db_prefix = "$outdir/$prefix-db";
+mkdir $db_prefix unless -d $db_prefix;
+$db_prefix .= "/$prefix";
+
+run("ln -s $contig_file $id_renamed_contig_file") unless (-f $id_renamed_contig_file);
+if ($step == 2){
+  logger("make blast+ database for all contigs");
+  
+  $cmd = "$makeblastdb -in $id_renamed_contig_file -dbtype nucl -out $db_prefix";
+  run($cmd, "make blast database");
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+# blastn
+my $blast_result = "$outdir/$prefix.blast.tsv";;
+if ($step == 3){
+  logger("perform all-vs-all blastn of sequences");
+ 
+  logger("split fasta");
+  my $fa_dir = "$outdir/split_fa";
+  run("mkdir -p $fa_dir") unless -d $fa_dir;
+  split_fa($id_renamed_contig_file, $fa_dir, $nparts);
+
+  logger("write blast all_vs_all shell");
+  my $blastn_shell = "$outdir/parallel_blastn.sh";
+  my @fa_files = glob("$fa_dir/*.fa");
+  logger("number of split fa files dose not equal to $nparts", "ERROR") if @fa_files != $nparts;
+  
+  open O, ">$blastn_shell" or die $!;
+  foreach my $f (@fa_files){
+  	my $sh = "$blastn -query $f -db $db_prefix -outfmt '6 std qlen slen' -max_target_seqs 10000 -out $f.blast.tsv -num_threads $nthreads";
+	print O $sh, "\n";
+  }
+  close O;
+
+  run("parallel -j $nparts < $blastn_shell", "parallel blastn");
+
+  logger("Merge blastn results");
+  my @blast_result = glob("$fa_dir/*.blast.tsv");
+  logger("number of split fa files dose not equal to $nparts", "ERROR") if @blast_result != $nparts;
+  run("cat $fa_dir/*.blast.tsv > $blast_result", "Merge blast result");
+
+  # cleanup
+  run("rm -r $fa_dir", "clean intermediate files") if ($fa_dir ne "/");
+
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+# calculate ANI
+my $ani_result = "$outdir/$prefix.ani.tsv";;
+if ($step == 4){
+  logger("calculate pairwise ANI by combining local alignments between sequence pairs");
+  
+  open SH, ">$outdir/anicalc.sh";
+  print SH "#!/bin/bash\n\n";
+  print SH "source $conda_sh\n";
+  print SH "conda activate $conda_env && python $anicalc -i $blast_result -o $ani_result && conda deactivate\n";
+  close SH;
+  
+  $cmd = "bash $outdir/anicalc.sh";
+  run($cmd, "anicalc");
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+# clustering
+my $cluster_result = "$outdir/$prefix.clusters.tsv";
+if($step == 5){
+  logger("perform Uclust-like clustering using MIUVIG recommended parameters(95\%ANI + 85\%AF");
+  unless (-f $ani_result){
+  	$ani_result .= ".gz";
+	logger("ani tsv file dose not exists.", "ERROR") unless -f $ani_result;
+  }
+
+  open SH, ">$outdir/aniclust.sh";
+  print SH "#!/bin/bash\n\n";
+  print SH "source $conda_sh\n";
+  print SH "conda activate $conda_env && python $aniclust --fna $id_renamed_contig_file --ani $ani_result --out $cluster_result --min_ani $min_ani --min_tcov $min_tcov --min_qcov $min_qcov && conda deactivate\n";
+  close SH;
+  
+  $cmd = "bash $outdir/aniclust.sh";
+  run($cmd, "aniclust");
+  
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+# extract vOTUs sequences
+my $vOTU_file = "$outdir/$prefix.vOTUs.fa";
+if ($step == 6){
+  logger("extract vOTU sequences");
+  extract_vOTU_seqs($id_renamed_contig_file, $cluster_result);
+  
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+# checkv assess
+if ($step == 7){
+  logger("checkv assess viral genome completeness");
+  
+  open SH, ">$outdir/checkv.sh";
+  print SH "#!/bin/bash\n\n";
+  print SH "source $conda_sh\n";
+  print SH "conda activate $conda_env && checkv end_to_end $vOTU_file $outdir -t $nthreads -d $checkv_database && conda deactivate\n";
+  close SH;
+  
+  $cmd = "bash $outdir/checkv.sh";
+  run($cmd, "checkv");
+  
+  $step++;
+  exit if $step >= $max_step;
+  exit if $only_one_step;
+}
+
+$elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub split_fa {
+    my ($fasta, $dir, $n) = @_;
+
+   my @fhs;
+   for(my $i = 0; $i < $n; ++$i){
+      open $fhs[$i], ">$dir/slice_$i.fa" or die $!;
+   }
+
+   local $/=">";
+   my $count = 0;
+   open IN, $fasta or die $!;
+   while(<IN>){
+       chomp;
+       next if (/^$/);
+
+       my $idx = (($count/$n)&0x1) ? ($n - 1 - $count % $n) : ($count % $n);
+       print {$fhs[$idx]} ">$_";
+       
+       $count++; 
+   }
+   close IN;
+   for(my $i = 0; $i < $n; ++$i){
+      close $fhs[$i];
+   } 
+}
+
+sub extract_vOTU_seqs {
+    my $ctg_file = shift;
+    my $clst_file =shift;
+
+    my @vOTUs = ();
+    my %id_to_otu = ();
+    my $otu_idx = 0;
+
+    open IN, "$clst_file" or die $!;
+    while(<IN>){
+        chomp;
+        next if (/^$/);
+        my ($canonical_seq, $pops) = split /\s+/, $_;
+        my @pops = split /,/, $pops;
+        #foreach my $s (@pops) {
+        #    push @{$id_to_otu{$s}}, $otu_idx;
+        #}
+        push @{$id_to_otu{$canonical_seq}}, $otu_idx;
+        push @vOTUs, [@pops];
+        $otu_idx++;
+    }
+    close IN;
+
+    my $nOTUs = @vOTUs;
+    logger("Total $nOTUs vOTUs.");
+    # write vOTUs
+    open O, ">$vOTU_file";
+    local $/=">";
+    open IN, $ctg_file or die $!;
+    while(<IN>){
+        chomp;
+        next if (/^$/);
+        my ($id, @seqs) = split /\n/, $_;
+        my @id = split /\s+/, $id;
+        my $otu_ids = $id_to_otu{$id[0]};
+        next unless (defined $otu_ids);
+
+        logger("contig $id[0] assiged to multiple vOTUs", "ERROR") if (@$otu_ids >= 2);
+
+
+        my $canonical_sign = $vOTUs[$otu_ids->[0]]->[0] eq $id[0] ? "*" : "x";
+        my $nseq = @{$vOTUs[$otu_ids->[0]]};
+
+	#print O ">vOTU_",$otu_ids->[0]."|$canonical_sign|$id[0]|$nseq\n", join("\n", @seqs), "\n";
+        print O ">vOTU_",$otu_ids->[0]."|$id[0]|$nseq\n", join("\n", @seqs), "\n";
+
+    }
+    close IN;
+    close O;
+}
+
+sub check_dep {
+    my $exe = shift;
+
+    my $bin = `which $exe`; chomp $bin;
+    logger("$exe not found, please install", "ERROR") if $bin eq "";
+
+    return $bin;
+}
+
+sub rename_contig_id {
+
+    my $file = shift;
+    my $flist = shift;
+
+    logger("contig file and list file should not be specified at the same time", "ERROR") if (defined $file and defined $flist);
+
+    if (defined $file){
+        # append idx
+        local $/=">";
+        my $idx = 0;
+
+        open O, ">$id_renamed_contig_file" or die $!;
+        open IN, $file or die $!;
+        while (<IN>){
+            chomp;
+            next if (/^$/);
+            my ($id, @seqs) = split /\n+/, $_;
+            my @id = split /\s+/, $id;
+            $id[0] .= "\@$idx";
+            $id = join(" ", @id);
+            $idx++;
+
+            print O ">", join("\n", $id, @seqs), "\n";
+        }
+
+        close IN;
+        close O;
+
+    }elsif(defined $flist){
+        my @flist = ();
+        open IN, "$flist" or die $!;
+        while(<IN>){
+            chomp;
+            next if (/^$/ or /^\#/);
+            my ($sample, $fpath) = split /\s+/, $_;
+            push @flist, [$sample, $fpath];
+        }
+        close IN;
+
+        open O, ">$id_renamed_contig_file" or die $!;
+        local $/=">";
+        foreach my $pair (@flist){
+            my $sample = $pair->[0];
+            logger("read file $pair->[0] and rename contig id");
+            open IN, $pair->[1] or die $!;
+            while(<IN>){
+                chomp;
+                next if (/^$/);
+                my ($id, @seqs) = split /\n+/, $_;
+                my @id = split /\s+/, $id;
+                $id[0] .= "\@$sample";
+                $id = join(" ", @id);
+                print O ">", join("\n", $id, @seqs), "\n"
+            }
+            close IN;
+        }
+        close O;
+    }
+}
+
+sub run {
+    my $cmd = shift;
+    my $msg = shift;
+    $msg = "" unless defined $msg;
+    
+    logger("CMD: ".$cmd);
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("$msg done in $elapsed_time s");
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+    checkv derep pipeline:
+
+    contig filelist is a TSV file with format:
+    <SampleName>    <Viral contigs filepath>
+
+Usage:
+  Options:
+  -i    <file>          input contig FASTA file,  forced if '-l' not specified
+  -l    <file>          input contig FASTA file list, forced if '-i' not specified
+  -o    <dir>           output dir , default [$outdir]
+  -d    <dir>           path of checkV database, forced if max_step>=7
+  -p    <str>           output prefix, forced
+  -t    <int>           the number of threads used in blastn, default [$nthreads]
+  -n    <int>           the number of jobs used in blastn, default [$nparts]
+  -ani  <int>           minimal ANI used in clustering, default [$min_ani]
+  -tc   <int>           minimal target coverage threshold, default [$min_tcov]
+  -qc   <int>           minimal query coverage threshold, default [$min_qcov]
+  -s    <int>           pipeline step, 1-6, default [$step]
+                          1: rename contig id 
+                          2: make blastdb
+                          3: blastn
+                          4: calculate ANI
+                          5: ANI clustering
+                          6: extract vOTUs
+                          7: checkV assessment
+  -m    <int>           max step, default [$max_step]
+  -one-step             do a single step
+  -conda_env            conda env name, default [$conda_env]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

@@ -1,0 +1,147 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $model_dir;
+my $outdir;
+my $nparts = 10;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$model_dir,
+                                "o:s"=>\$outdir,
+                                "n:i"=>\$nparts,
+                                ) or &USAGE;
+&USAGE unless ($model_dir &&  $outdir);
+
+$model_dir = Cwd::abs_path($model_dir);
+$outdir = Cwd::abs_path($outdir);
+mkdir $outdir unless -d $outdir;
+
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+# get mm files
+
+my @mm_files = glob("$model_dir/*.mm");
+
+my $n_mm = @mm_files;
+logger("Total mm files in model dir: $n_mm");
+
+my @db_slice = ();
+
+for(1..$nparts){
+	push @db_slice, [];
+}
+
+for(my $i = 0; $i < $n_mm; ++$i){
+	my $id = $i % $nparts;
+	push @{$db_slice[$id]}, $mm_files[$i];
+}
+
+open SH, ">$outdir/tar.sh" or die $!;
+for (my $i = 0; $i < $nparts; $i++){
+
+	my $slice_dir = "$outdir/$i";
+	mkdir $slice_dir unless -d $slice_dir;
+
+	my $db_dir = "$slice_dir/model_dir";
+	mkdir $db_dir unless -d $db_dir;
+
+
+	logger("copy model data to slice $i");
+	for my $f(@{$db_slice[$i]}){
+		run("ln -f $f $db_dir", 0);
+	}	
+
+	logger("archive model data of slice $i");
+	#run("cd $slice_dir && tar -czf wishdb_$i.tar.gz ./model_dir && cd -");
+	print SH "cd $slice_dir && tar -czf wishdb_$i.tar.gz ./model_dir && cd -\n";
+}
+close SH;
+
+run("parallel -j $nparts < $outdir/tar.sh");
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+sub run {
+    my $cmd = shift;
+    my $verbose = shift;
+    $verbose = 1 unless defined $verbose;
+
+    logger("CMD: ".$cmd) if $verbose;
+    my $stime = time;
+    my $ret = system($cmd);
+    if ($ret){
+        logger("failed to execute command line", "ERROR");
+    }
+
+    my $elapsed_time = time - $stime;
+    logger("Elapsed time: $elapsed_time s") if $verbose;
+    logger("CMD Done.") if $verbose;
+}
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	split wish db
+
+Usage:
+  Options:
+  -i    <dir>           input wish model dir, forced
+  -o    <dir>           output dir , forced
+  -n    <int>           split into  # parts, default [$nparts]
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}

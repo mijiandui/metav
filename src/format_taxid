@@ -1,0 +1,146 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Term::ANSIColor qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path getcwd);
+my @ORI_ARGV = @ARGV;
+
+my $map_file;
+my $fa;
+my $outfile;
+
+GetOptions(
+                                "help|?" =>\&USAGE,
+                                "i:s"=>\$map_file,
+                                "f:s"=>\$fa,
+                                "o:s"=>\$outfile,
+                                ) or &USAGE;
+&USAGE unless ($map_file &&  $fa && $outfile);
+
+
+
+###############
+# main
+###############
+logger("Running: perl $0 ".join(" ", @ORI_ARGV));
+logger("Program Start.");
+
+my $stime = time;
+
+logger("load tax id map  table");
+
+my %map;
+open IN, $map_file or die $!;
+while(<IN>){
+	chomp;
+	next if (/^$/);
+
+	my ($viruses, $taxid) = split /\t+/, $_;
+	my @viruses = split /;/, $viruses;
+	for my $v (@viruses){
+		$v=~s/^\s+//g;
+		$v=~s/\s+$//g;
+		$map{$v} = $taxid;
+	}
+}
+close IN;
+
+logger("Load protein fa");
+
+open IN, $fa or die $!;
+open O, ">$outfile" or die $!;
+
+local $/=">";
+my $discard = 0;
+my $total = 0;
+my $retained = 0;
+while(<IN>){
+	chomp;
+	next if (/^$/);
+
+	my ($id, @seqs) = split /\n/, $_;
+
+	$total++;
+	my ($name, $virus) = $id=~/(\S+).*\[(.*)\]$/;
+	unless (defined $name and defined $virus){
+	    $discard++;
+	    next;
+	}
+	#die "can not parse name from line: $id" unless defined $name;
+	#die "can not parse virus from line: $id" unless defined $virus;
+
+
+	if (defined $map{$virus}){
+		$name .= "_".$map{$virus};
+		print O ">$name\n", join("\n", @seqs), "\n";
+		$retained++;
+	}else{
+		$discard++;
+	}
+}
+
+close O;
+close IN;
+
+logger("Total protein: $total");
+logger("Retained protein: $retained");
+logger("Discarded protein: $discard");
+
+my $elapsed_time = time - $stime;
+logger("Elapsed time: $elapsed_time s");
+logger("Program Done.");
+
+##########
+# sub
+##########
+
+
+sub logger {
+    my $msg = shift;
+    my $level = shift;
+    $level = "INFO" unless defined $level;
+
+    print STDERR "[".GetTime()."] [";
+    if ($level eq "INFO"){
+        print STDERR GREEN $level;
+    }elsif($level=~/WARN/i){
+        print STDERR YELLOW $level;
+    }else{
+         print STDERR RED $level;
+    }
+    print STDERR "] $msg\n";
+
+    if ($level eq "ERROR" or $level eq "FATAL"){
+        exit(-1);
+    }
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+        my $usage=<<"USAGE";
+Program: $0
+Contact: Ma chouxian <biomath_2014\@163.com>
+Discription:
+	reformat protein fa
+
+Usage:
+  Options:
+  -i    <file>          input taxid map file, forced
+  -f    <file>          protein fasta file , forced
+  -o    <file>          output file , forced
+  -h                    help
+
+USAGE
+        print $usage;
+        exit;
+}
